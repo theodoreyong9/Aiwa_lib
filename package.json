@@ -1,22 +1,10 @@
 {
   "name": "aiwa-lib",
-  "version": "0.1.0",
-  "description": "A signature-agnostic content-addressed event DAG and dual-mode P2P transport — the shared foundation under aiwa-core, aiwa-platform, and the YourMine stack.",
+  "version": "0.0.0",
+  "description": "The public developer-facing facade over @aiwa/core and @aiwa/platform — not yet built. See README.",
   "type": "module",
   "license": "MIT",
-  "main": "src/index.js",
-  "exports": {
-    ".": "./src/index.js"
-  },
   "scripts": {
     "test": "node --test"
-  },
-  "peerDependencies": {
-    "trystero": "^0.25.3"
-  },
-  "peerDependenciesMeta": {
-    "trystero": {
-      "optional": true
-    }
   }
 }
