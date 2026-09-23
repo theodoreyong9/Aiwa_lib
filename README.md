@@ -20,6 +20,47 @@ never reimplemented here:
   without needing to understand `EventLog`/`adapt-event.js` internals
   to get real authorization right.
 
+## Where this sits
+
+```
+       ┌────────────────────────────────────────────────┐
+       │ AIWA_project                                   │
+       │ one concrete deployment (a single static page, │
+       │ no build step, no fixed server)                │
+       └────────────────────────────────────────────────┘
+                                │
+                                │  imports all three, directly
+                                ▼
+               ┌──────────────────────────────────┐
+               ▼                                  ▼
+┌────────────────────────────┐      ┌───────────────────────────┐
+│ aiwa-lib  <-- you are here │      │ aiwa-platform             │
+│ public wallet API (AIWA),  │      │ transport, replication,   │
+│ Channel, contract SDK      │      │ capability-gated storage, │
+│                            │      │ bundle publishing         │
+└────────────────────────────┘      └───────────────────────────┘
+               │                                  │
+               └────────────────┬─────────────────┘
+                                ▼
+        ┌──────────────────────────────────────────────┐
+        │ aiwa-core                                    │
+        │ the protocol itself: identity, event log,    │
+        │ progression, accrual, conservation, Mirror,  │
+        │ Causal Tick, contracts, delegation, vouchers │
+        │                                              │
+        │ depends on nothing of its own - only         │
+        │ @noble/curves, @noble/hashes, @scure/bip39,  │
+        │ optional @solana/web3.js                     │
+        └──────────────────────────────────────────────┘
+```
+
+`aiwa-lib` never redefines what counts as a valid state transition —
+that's `aiwa-core`'s job alone (see its own README). This package only
+composes real primitives from the two layers below it into a
+developer-facing API; `Channel` and bearer vouchers are real protocol
+extensions that live in `aiwa-core` itself (not layered on here) for
+exactly that reason.
+
 ## The wallet API
 
 One real Ed25519 keypair is BOTH your Solana address and your AIWA
