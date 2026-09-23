@@ -253,7 +253,7 @@ was silently rejected until this was accounted for.
 
 ## Status
 
-24 passing `node --test` cases. Depends on `aiwa-core` and
+25 passing `node --test` cases. Depends on `aiwa-core` and
 `aiwa-platform` via their GitHub URLs (none of the three are on npm
 yet).
 

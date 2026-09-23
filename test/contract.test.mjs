@@ -127,3 +127,10 @@ test('verifySignedAction rejects a tampered field even with an otherwise-real si
   const tampered = { ...payload, amount: '999999' };
   assert.equal(await verifySignedAction(tampered), false);
 });
+
+test('REGRESSION: signedAction/verifySignedAction are really importable from the public "aiwa-lib" package entry, exactly as the README documents — not just from src/contract.js directly', async () => {
+  const { signedAction: pkgSignedAction, verifySignedAction: pkgVerifySignedAction } = await import('aiwa-lib');
+  const identity = await generateIdentity();
+  const payload = await pkgSignedAction(identity, { from: identity.id, action: 'ping' });
+  assert.equal(await pkgVerifySignedAction(payload), true);
+});
