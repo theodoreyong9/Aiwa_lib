@@ -312,6 +312,22 @@ export class AIWA {
    * nobody — the recipient's balance simply never moved, silently.
    * "Send over the network" was never actually verified end to end
    * before this was found.
+   *
+   * SECOND REAL BUG, FOUND THE SAME WAY: publishing only the bare new
+   * event(s) still silently fails EventLog.appendMany() on the
+   * recipient's side whenever their log doesn't already have this
+   * event's full ancestor chain (e.g. they connected before your
+   * commitment/progression/claim history existed, so the one-time
+   * HELLO sync above never carried it either) — appendMany() throws
+   * "unresolvable missing parents", and Replicator's own message queue
+   * catches and only console.errors that, so the recipient's balance
+   * again silently never moves, with no error surfaced anywhere the
+   * sender can see. Publishing the full ancestor closure (the same
+   * collectAncestors() bundle sendOfflineBundle() already relies on)
+   * is what actually makes this appendable no matter what the
+   * recipient already has; already-known ancestor events are a real
+   * no-op on append (see EventLog.append()), so this is safe to do
+   * every time, not just for a stranger's first sync.
    */
   async send(toIdentityId, amount) {
     this._requireConnected();
@@ -326,7 +342,7 @@ export class AIWA {
     });
     await this.log.append(transferEvent);
     events.push(transferEvent);
-    if (this.replicator) await this.replicator.publish(events);
+    if (this.replicator) await this.replicator.publish(await collectAncestors(this.log, events.map((e) => e.id)));
 
     return { events, newClaimId: `activated:${sourceClaim.id}:${this.identity.id}:${toIdentityId}:0:identity` };
   }
@@ -525,10 +541,13 @@ export class Channel {
    * this channel's own peer. No further root-key involvement, ever —
    * including for splitting, so this keeps working after the owner's
    * root identity disconnects. If the owner still has a live network
-   * session, the new event(s) are also published to connected peers
-   * (see AIWA.send()'s own header for the real bug this fixes: without
-   * this, a click made after the initial peer handshake reached
-   * nobody, silently).
+   * session, the new event(s) are also published to connected peers —
+   * publishing the FULL ancestor closure, not just the bare new
+   * event(s) (see AIWA.send()'s own header for both real bugs this
+   * fixes: a click made after the initial peer handshake reaching
+   * nobody, and a peer whose log doesn't yet have this channel's own
+   * causal history — commitment, progression, claim, the delegation
+   * itself — being unable to append the transfer at all).
    */
   async send(amount) {
     const aiwa = this._aiwa;
@@ -542,7 +561,7 @@ export class Channel {
     });
     await aiwa.log.append(transferEvent);
     events.push(transferEvent);
-    if (aiwa.replicator) await aiwa.replicator.publish(events);
+    if (aiwa.replicator) await aiwa.replicator.publish(await collectAncestors(aiwa.log, events.map((e) => e.id)));
     return { events, newClaimId: `activated:${sourceClaim.id}:${this._delegation.from}:${this.peerId}:0:identity` };
   }
 

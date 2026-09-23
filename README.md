@@ -291,23 +291,47 @@ was silently rejected until this was accounted for.
 
 ## Status
 
-29 passing `node --test` cases. Depends on `aiwa-core` and
+31 passing `node --test` cases. Depends on `aiwa-core` and
 `aiwa-platform` via their GitHub URLs (none of the three are on npm
 yet).
 
-**Fixed a real bug this pass**: `AIWA.send()` and `Channel.send()`
-appended the new transfer event to the local log but never called
-`aiwa-platform`'s `Replicator.publish(events)` — so a send made
-*after* a peer was already connected silently never reached them.
-`Replicator` only syncs automatically via a one-time `HELLO`/
-`HELLO_ACK` handshake at the moment two peers join the same room; it
-has no mechanism that re-syncs on its own afterward. Both methods now
-call `replicator.publish(events)` right after appending, and
-`test/wallet.test.mjs` has two `REGRESSION:` tests (using
+**Fixed two real, related bugs this pass** — found live, while
+building a Channel-over-its-own-transport demo, by watching a real
+recipient's balance simply never move:
+
+1. `AIWA.send()` and `Channel.send()` appended the new transfer event
+   to the local log but never called `aiwa-platform`'s
+   `Replicator.publish(events)` — so a send made *after* a peer was
+   already connected silently never reached them. `Replicator` only
+   syncs automatically via a one-time `HELLO`/`HELLO_ACK` handshake at
+   the moment two peers join the same room; it has no mechanism that
+   re-syncs on its own afterward.
+2. Even after fixing (1), publishing only the *bare* new event(s)
+   still silently failed on a peer whose log didn't already have this
+   event's full causal history (e.g. they connected before your
+   commitment/progression/claim history existed) — `EventLog.appendMany()`
+   throws "unresolvable missing parents", and `Replicator`'s own
+   message queue catches and only `console.error`s that, so the
+   failure is invisible to the sender too.
+
+Both methods now publish the FULL ancestor closure of the new
+event(s) (`collectAncestors()` — the same bundling
+`sendOfflineBundle()` already relies on for a zero-prior-sync
+stranger), not just the bare new events; already-known ancestor events
+are a real no-op on append, so this is safe to do on every send.
+`test/wallet.test.mjs` has four `REGRESSION:` tests (using
 `aiwa-platform`'s `LoopbackTransport` for a deterministic, in-memory
-two-peer connection) that connect two wallets first and only then
-send, confirming the recipient's balance actually updates — the exact
-case that was silently broken before.
+two-peer connection) covering both orderings — peers connect before
+funding, and peers connect after funding — for both `send()` and
+`Channel.send()`.
+
+Also found and fixed the same pass: those tests themselves leaked
+`LoopbackTransport` peers into its process-wide static registry by
+never calling `leaveNetwork()`, so a wallet from one test kept
+"replying" to every later test's own connection handshake with its own
+unrelated event history — real, intermittent test cross-talk once
+enough `LoopbackTransport` tests existed in the same file. Fixed by
+having every such test call `leaveNetwork()` on both peers when done.
 
 ## Testing
 

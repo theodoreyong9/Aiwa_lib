@@ -350,6 +350,16 @@ test('REGRESSION: send() over a live network session actually reaches an already
   await new Promise((r) => setTimeout(r, 50)); // let the real EVENTS/ACK round trip settle
 
   assert.equal(await bob.balance(), claimable, 'a send() made after the peers already connected must still reach bob — it did not before replicator.publish() was wired in');
+
+  // LoopbackTransport keeps a real, process-wide static registry — a
+  // peer that never leaveNetwork()s stays "connected" forever and
+  // keeps replying to every later test's own HELLO with its own,
+  // unrelated event history, corrupting log.head() for any wallet that
+  // later joins the same domain. Real, found the hard way: the two
+  // tests below intermittently failed once this file had enough
+  // LoopbackTransport tests for that cross-talk to actually collide.
+  await alice.leaveNetwork();
+  await bob.leaveNetwork();
 });
 
 test('REGRESSION: a Channel send over a live network session also reaches an already-connected peer', async () => {
@@ -372,4 +382,65 @@ test('REGRESSION: a Channel send over a live network session also reaches an alr
   await new Promise((r) => setTimeout(r, 50));
 
   assert.equal(await bob.balance(), claimable, 'a channel click made after the peers already connected must still reach bob');
+
+  await alice.leaveNetwork();
+  await bob.leaveNetwork();
+});
+
+test('REGRESSION: send() still reaches a peer that connected BEFORE the sender was even funded — publishing bare new events is not enough, the full ancestor chain must go too', async () => {
+  const alice = new AIWA({ rewardParams });
+  const aliceId = await alice.connect();
+  const bob = new AIWA({ rewardParams });
+  const bobId = await bob.connect();
+
+  // Peers connect FIRST, while both logs are still empty — the exact
+  // ordering the live demo used and the second real bug this exposed:
+  // the one-time initial HELLO/HELLO_ACK exchange above synced nothing
+  // (both sides had nothing yet), and recordCommitment/advanceProgress/
+  // claim below never call publish() themselves — so bob's log never
+  // learns about alice's commitment/progression/claim history at all.
+  // Publishing only the bare transfer event later is then unappendable
+  // on bob's side (its parent chain is entirely unknown to him) and
+  // Replicator's own message queue silently swallows that failure.
+  await alice.joinNetwork(new LoopbackTransport(aliceId.identityId));
+  await bob.joinNetwork(new LoopbackTransport(bobId.identityId));
+  await new Promise((r) => setTimeout(r, 50));
+
+  await alice.recordCommitment({ b: 100 });
+  for (let i = 0; i < 5; i++) await alice.advanceProgress({ vdfIterations: VDF_ITERATIONS });
+  const claimable = await alice.claimable();
+  await alice.claim(claimable);
+
+  await alice.send(bobId.identityId, claimable);
+  await new Promise((r) => setTimeout(r, 50));
+
+  assert.equal(await bob.balance(), claimable, 'bob must still receive the send even though his log never independently learned alice\'s pre-send history');
+
+  await alice.leaveNetwork();
+  await bob.leaveNetwork();
+});
+
+test('REGRESSION: a Channel send still reaches a peer that connected BEFORE the owner was even funded', async () => {
+  const alice = new AIWA({ rewardParams });
+  const aliceId = await alice.connect();
+  const bob = new AIWA({ rewardParams });
+  const bobId = await bob.connect();
+
+  await alice.joinNetwork(new LoopbackTransport(aliceId.identityId));
+  await bob.joinNetwork(new LoopbackTransport(bobId.identityId));
+  await new Promise((r) => setTimeout(r, 50));
+
+  await alice.recordCommitment({ b: 100 });
+  for (let i = 0; i < 5; i++) await alice.advanceProgress({ vdfIterations: VDF_ITERATIONS });
+  const claimable = await alice.claimable();
+  await alice.claim(claimable);
+
+  const channel = await alice.openChannel(bobId.identityId);
+  await channel.send(claimable);
+  await new Promise((r) => setTimeout(r, 50));
+
+  assert.equal(await bob.balance(), claimable, 'bob must still receive the channel send even though his log never independently learned alice\'s pre-open history');
+
+  await alice.leaveNetwork();
+  await bob.leaveNetwork();
 });
