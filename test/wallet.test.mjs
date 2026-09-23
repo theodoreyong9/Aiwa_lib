@@ -238,3 +238,28 @@ test('SECURITY: a channel cannot move a claim the root identity does not actuall
   const channel = await alice.openChannel('bob-id', { requireNetwork: false });
   await assert.rejects(channel.send('1.0'), /No single active claim/);
 });
+
+test('a channel keeps working — balance() AND a real split — after the owner\'s root identity disconnects', async () => {
+  const alice = new AIWA({ rewardParams });
+  await alice.connect();
+  await alice.recordCommitment({ b: 100 });
+  for (let i = 0; i < 5; i++) await alice.advanceProgress({ vdfIterations: VDF_ITERATIONS });
+  const claimable = await alice.claimable();
+  await alice.claim(claimable);
+
+  const channel = await alice.openChannel('bob-id', { requireNetwork: false });
+  await alice.disconnect(); // root key + identity gone from memory — channel must not need either again
+
+  await assert.doesNotReject(channel.balance(), 'balance() must not require aiwa.identity — it reads the owner\'s id from the delegation itself');
+  assert.equal(await channel.balance(), claimable);
+
+  // No existing claim matches this amount exactly — this MUST split,
+  // and splitting must not fall back to the (now absent) root key.
+  const partial = (Number(claimable) / 3).toString();
+  await assert.doesNotReject(channel.send(partial));
+  await assert.doesNotReject(channel.send(partial));
+
+  const state = await alice._materializeWallet();
+  const bobClaims = spendableClaims(state, 'bob-id');
+  assert.equal(bobClaims.length, 2, 'two real, independent delegated sends, each needing its own real, delegate-signed split — no root key involved for either');
+});

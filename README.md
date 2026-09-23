@@ -141,16 +141,29 @@ await channel.send('0.10'); // click — the root key is never touched again
 ```
 
 This is real delegation (aiwa-core's own `issueDelegation`/
-`buildSignedDelegatedTransferEvent`), **not** a pre-funded escrow
-account: `openChannel()` moves zero funds. It derives a real,
-deterministic session key for this exact (your identity, this peer)
-pair — always the same key, recoverable even after a crash, never a
-randomly-generated throwaway you could lose track of — and signs ONE
-real delegation authorizing it. Every `channel.send()` afterward is a
-fresh, independent, delegate-signed real transfer of whatever you
-currently, genuinely own; the delegate can never move more than that,
-and a compromised session key only ever threatens funds you actually
-hold, for this one peer, same as your root key already could.
+`buildSignedDelegatedTransferEvent`/`buildSignedDelegatedSplitEvent`),
+**not** a pre-funded escrow account: `openChannel()` moves zero funds.
+It derives a real, deterministic session key for this exact (your
+identity, this peer) pair — always the same key, recoverable even
+after a crash, never a randomly-generated throwaway you could lose
+track of — and signs ONE real delegation authorizing it. Every
+`channel.send()` afterward is a fresh, independent, delegate-signed
+real transfer of whatever you currently, genuinely own; the delegate
+can never move more than that, and a compromised session key only ever
+threatens funds you actually hold, for this one peer, same as your
+root key already could.
+
+The channel is genuinely self-sufficient once opened, including its
+own splitting: the same one-time delegation also authorizes the
+delegate to split an existing claim into the exact amount a send
+needs, via a real, delegate-signed `'delegated-split'` — the owner's
+root key is never touched again for ANY amount, not just ones that
+happen to match an existing claim exactly. `channel.balance()` reads
+the owner's id from the delegation itself, not from `aiwa.identity`.
+Concretely: `aiwa.disconnect()` (clearing the root identity from
+memory) does not stop an already-open channel from sending, splitting,
+or reporting its balance — see the "keeps working... after the owner's
+root identity disconnects" test in this repo's own test suite.
 
 **Honest limit, by explicit design**: no amount cap, no expiry, no
 revocation. An issued delegation is valid for as long as you keep using
@@ -240,7 +253,7 @@ was silently rejected until this was accounted for.
 
 ## Status
 
-23 passing `node --test` cases. Depends on `aiwa-core` and
+24 passing `node --test` cases. Depends on `aiwa-core` and
 `aiwa-platform` via their GitHub URLs (none of the three are on npm
 yet).
 

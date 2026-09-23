@@ -36,7 +36,7 @@ import {
   generateLightweightKeypair, lightweightKeypairFromSecretKey, deriveKeypairFromPassphrase,
   deriveKeypairFromBip39Mnemonic, keypairFromSecretKey, loadSolanaWeb3, toIdentity,
   broadcastBurnTransaction, SOLANA_INCINERATOR_ADDRESS, vdfSeed, computeVdfChain,
-  issueDelegation, buildSignedDelegatedTransferEvent,
+  issueDelegation, buildSignedDelegatedTransferEvent, buildSignedDelegatedSplitEvent,
 } from 'aiwa-core';
 import { Replicator } from 'aiwa-platform';
 import { collectAncestors } from './ancestors.js';
@@ -402,15 +402,59 @@ export class Channel {
   /** This channel's own real, deterministic session address — distinct from your own root address, one per peer. */
   get address() { return this._keypair.publicKey.toBase58(); }
 
-  /** What you (the real owner) still have available to send through this or any other channel — delegation never partitions your balance, it only authorizes moving it. */
+  /**
+   * What the real owner still has available to send through this or
+   * any other channel — delegation never partitions the balance, it
+   * only authorizes moving it. Reads the owner's id from the
+   * delegation itself, not aiwa.identity — this keeps working even
+   * after the owner's root identity disconnects, exactly like send().
+   */
   async balance() {
-    return this._aiwa.balance();
+    const aiwa = this._aiwa;
+    const state = await aiwa._materializeWallet();
+    return fromUnits(totalBalance(aiwa.rewardParams, state, this._delegation.from));
   }
 
-  /** "Click to send" — a real, delegate-signed transfer of `amount` to this channel's own peer. No further root-key involvement. */
+  /**
+   * Splits, if needed, using the SAME delegation send() uses — a
+   * delegate-signed 'delegated-split', never the owner's root key.
+   * Mirrors AIWA._ensureSpendableClaim's own v1 limitation (a single
+   * active claim >= amount; no consolidation yet).
+   */
+  async _ensureSpendableClaim(amount) {
+    const aiwa = this._aiwa;
+    const amountUnits = toUnits(amount);
+    const state = await aiwa._materializeWallet();
+    const claims = spendableClaims(state, this._delegation.from);
+    const events = [];
+    let sourceClaim = claims.find((c) => c.amount === amountUnits);
+
+    if (!sourceClaim) {
+      const bigEnough = claims.find((c) => c.amount > amountUnits);
+      if (!bigEnough) {
+        throw new Error(`No single active claim covers ${amount} AIWA (v1 limitation — consolidate claims first).`);
+      }
+      const firstId = crypto.randomUUID();
+      const secondId = crypto.randomUUID();
+      const signedSplit = await buildSignedDelegatedSplitEvent(
+        this._delegation, { claimId: bigEnough.id, firstAmount: amount, firstId, secondId },
+        this._keypair.secretKey.slice(0, 32), this._keypair.publicKey.toBytes(),
+      );
+      const splitEvent = await createEvent(this.identity, {
+        domain: aiwa.logDomain, parents: await aiwa.log.head(), type: 'delegated-split', payload: signedSplit,
+      });
+      await aiwa.log.append(splitEvent);
+      events.push(splitEvent);
+      sourceClaim = { id: firstId, amount: amountUnits };
+    }
+
+    return { sourceClaim, events };
+  }
+
+  /** "Click to send" — a real, delegate-signed transfer of `amount` to this channel's own peer. No further root-key involvement, ever — including for splitting, so this keeps working after the owner's root identity disconnects. */
   async send(amount) {
     const aiwa = this._aiwa;
-    const { sourceClaim, events } = await aiwa._ensureSpendableClaim(amount); // splitting, if needed, still uses the owner's own root key — see _ensureSpendableClaim's own header
+    const { sourceClaim, events } = await this._ensureSpendableClaim(amount);
     const signedTransfer = await buildSignedDelegatedTransferEvent(
       this._delegation, { claimId: sourceClaim.id, to: this.peerId },
       this._keypair.secretKey.slice(0, 32), this._keypair.publicKey.toBytes(),
@@ -420,7 +464,7 @@ export class Channel {
     });
     await aiwa.log.append(transferEvent);
     events.push(transferEvent);
-    return { events, newClaimId: `activated:${sourceClaim.id}:${aiwa.identity.id}:${this.peerId}:0:identity` };
+    return { events, newClaimId: `activated:${sourceClaim.id}:${this._delegation.from}:${this.peerId}:0:identity` };
   }
 
   /** send() plus every real ancestor event the resulting transfer needs — the identical offline mechanism AIWA.sendOfflineBundle() uses, so a channel click works over QR/NFC/Bluetooth exactly like any other send. */
