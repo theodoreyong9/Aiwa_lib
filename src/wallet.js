@@ -140,6 +140,22 @@ export class AIWA {
     return fromUnits(totalBalance(this.rewardParams, state, this.identity.id));
   }
 
+  /**
+   * What you can actually send right now: the sum of your own already
+   * -claimed, active claims. `balance()` also includes `claimable()` —
+   * value that has accrued but hasn't been moved into a real, spendable
+   * claim yet, and so genuinely cannot be sent until claim()'d. A UI
+   * that lets someone "send" `balance()` will hit send()'s own "No
+   * single active claim covers..." error the moment even a sliver of
+   * new claimable has accrued since their last claim() — this is that
+   * distinction, made explicit rather than discovered by a failed send.
+   */
+  async spendableBalance() {
+    this._requireConnected();
+    const state = await this._materializeWallet();
+    return fromUnits(spendableClaims(state, this.identity.id).reduce((sum, c) => sum + c.amount, 0n));
+  }
+
   /** What's currently claimable from your own real, accrued position — not yet moved into a spendable claim. Decimal string. */
   async claimable() {
     this._requireConnected();

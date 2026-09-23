@@ -49,7 +49,8 @@ await aiwa.recordCommitment({ b: 10 }); // commits real capital, after a real bu
 await aiwa.startProgressLoop(); // advances your own real progression epoch on a timer — this is what makes claimable() actually grow
 const claimable = await aiwa.claimable(); // decimal string, e.g. "1.5"
 await aiwa.claim(claimable);
-const balance = await aiwa.balance();
+const balance = await aiwa.balance(); // includes claimable() — see spendableBalance() below for what you can actually send
+const spendable = await aiwa.spendableBalance(); // what send()/openChannel().send() can actually move right now
 
 // Real, live P2P sync, if you want it (see aiwa-platform's WebrtcTransport/Introducer).
 await aiwa.joinNetwork(transport);
@@ -88,6 +89,20 @@ adversarial, high-value transfers.
 active claim covering the amount (splitting a bigger one if needed) —
 they don't yet combine several smaller claims to reach it. A real,
 separate convenience (claim consolidation), not a protocol limit.
+
+**A real bug this surfaced, live, in the AIWA_project wallet UI**:
+`balance()` includes `claimable()` — value that has accrued but was
+never actually moved into a real, spendable claim. A UI that reads
+`balance()` and tries to `send()` that full amount gets a confusing
+`"No single active claim covers..."` error, since claimable value
+simply cannot be sent until `claim()`'d — and if even a sliver of new
+claimable has accrued since the last claim (a running
+`startProgressLoop()` does this constantly), `balance()` no longer
+matches any single real claim at all. `spendableBalance()` is the real
+answer to "how much can I actually send right now" — the sum of your
+own already-claimed, active claims, never inflated by still-growing
+claimable. `test/wallet.test.mjs` reproduces the exact failure this
+caused, then confirms `spendableBalance()` fixes it.
 
 **Honest limit**: a claim with a long real history bundles a
 correspondingly larger offline payload. QR codes have a real, practical
@@ -221,7 +236,7 @@ was silently rejected until this was accounted for.
 
 ## Status
 
-22 passing `node --test` cases. Depends on `aiwa-core` and
+23 passing `node --test` cases. Depends on `aiwa-core` and
 `aiwa-platform` via their GitHub URLs (none of the three are on npm
 yet).
 

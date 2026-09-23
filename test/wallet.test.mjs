@@ -70,6 +70,38 @@ test('the real accrual -> progression -> claimable -> claim -> balance pipeline'
   assert.equal(balance, claimable);
 });
 
+// Found via a real, live browser run of the AIWA_project wallet UI:
+// balance() includes claimable() — value that has accrued but was
+// never actually moved into a real, spendable claim. A UI that reads
+// balance() and tries to send() that full amount hits a confusing "No
+// single active claim covers..." error, since claimable value simply
+// cannot be sent until claim()'d. This reproduces that exact failure,
+// then confirms spendableBalance() is the real, always-correct answer
+// to "how much can I actually send right now."
+test('spendableBalance() is the actually-sendable amount — never inflated by claimable(), which balance() includes but cannot itself be sent', async () => {
+  const aiwa = new AIWA({ rewardParams });
+  await aiwa.connect();
+  await aiwa.recordCommitment({ b: 10 });
+  for (let i = 0; i < 5; i++) await aiwa.advanceProgress({ vdfIterations: VDF_ITERATIONS });
+
+  // Before any claim: claimable > 0, but nothing is genuinely spendable yet.
+  const claimableBefore = await aiwa.claimable();
+  assert.ok(Number(claimableBefore) > 0);
+  assert.equal(await aiwa.spendableBalance(), '0');
+  assert.equal(await aiwa.balance(), claimableBefore, 'balance() includes not-yet-claimed value');
+
+  // Sending the full "balance" here is exactly the mistake the real
+  // browser run of the wallet UI made — it fails, since none of it is
+  // actually in a real, spendable claim yet.
+  await assert.rejects(aiwa.send('bob', claimableBefore), /No single active claim/);
+
+  await aiwa.claim(claimableBefore);
+
+  // Now it genuinely is spendable, and spendableBalance() says so.
+  assert.equal(await aiwa.spendableBalance(), claimableBefore);
+  await assert.doesNotReject(aiwa.send('bob', await aiwa.spendableBalance()));
+});
+
 test('send() rejects when no single active claim covers the amount (v1 limitation, not a crash)', async () => {
   const aiwa = new AIWA({ rewardParams });
   await aiwa.connect();
