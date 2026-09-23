@@ -37,7 +37,8 @@ import {
   deriveKeypairFromBip39Mnemonic, keypairFromSecretKey, loadSolanaWeb3, toIdentity,
   broadcastBurnTransaction, SOLANA_INCINERATOR_ADDRESS, vdfSeed, computeVdfChain,
   issueDelegation, buildSignedDelegatedTransferEvent, buildSignedDelegatedSplitEvent,
-  deriveVoucherAddress, buildSignedVoucherRedeemEvent,
+  deriveVoucherAddress, buildSignedVoucherRedeemEvent, buildSignedDelegatedVoucherRedeemEvent,
+  buildSignedAccrualEvent, buildSignedClaimEvent, buildSignedDelegatedClaimEvent,
 } from 'aiwa-core';
 
 // A real, cryptographically random secret — 32 bytes, hex-encoded.
@@ -195,9 +196,12 @@ export class AIWA {
    */
   async recordCommitment({ b, T = 0 } = {}) {
     this._requireConnected();
+    const signedAccrual = await buildSignedAccrualEvent(
+      { domain: this.identity.id, b, T },
+      this._keypair.secretKey.slice(0, 32), this._keypair.publicKey.toBytes(),
+    );
     const event = await createEvent(this.identity, {
-      domain: this.logDomain, parents: await this.log.head(), type: 'accrual',
-      payload: { domain: this.identity.id, b, T },
+      domain: this.logDomain, parents: await this.log.head(), type: 'accrual', payload: signedAccrual,
     });
     await this.log.append(event);
     return { eventId: event.id };
@@ -248,9 +252,12 @@ export class AIWA {
     this._requireConnected();
     const heads = await this.log.head();
     const claimId = crypto.randomUUID();
+    const signedClaim = await buildSignedClaimEvent(
+      { domain: this.identity.id, amount, claimId },
+      this._keypair.secretKey.slice(0, 32), this._keypair.publicKey.toBytes(),
+    );
     const event = await createEvent(this.identity, {
-      domain: this.logDomain, parents: heads, type: 'claim',
-      payload: { domain: this.identity.id, amount, claimId },
+      domain: this.logDomain, parents: heads, type: 'claim', payload: signedClaim,
     });
     await this.log.append(event);
     return { claimId, eventId: event.id };
@@ -397,9 +404,18 @@ export class AIWA {
     return { events: bundle, newClaimId };
   }
 
-  /** Appends a real offline bundle (from sendOfflineBundle, or its own encodeOfflineBundle) — real signature/causal verification, identical to any other real append. */
+  /**
+   * Appends a real offline bundle (from sendOfflineBundle, or its own
+   * encodeOfflineBundle) — real signature/causal verification,
+   * identical to any other real append. Deliberately NOT gated by
+   * _requireConnected(): appending never signs anything with this
+   * wallet's own key — every event in the bundle is already, really
+   * signed by its own real sender — so receiving genuinely works
+   * whether or not this wallet's own root key is currently unlocked.
+   * this.log itself is created in the constructor, independent of
+   * connect()/disconnect(), so it's always available regardless.
+   */
   async receiveOfflineBundle(bundle) {
-    this._requireConnected();
     await this.log.appendMany(bundle.events);
   }
 
@@ -538,22 +554,28 @@ export class Channel {
 
   /**
    * "Click to send" — a real, delegate-signed transfer of `amount` to
-   * this channel's own peer. No further root-key involvement, ever —
-   * including for splitting, so this keeps working after the owner's
-   * root identity disconnects. If the owner still has a live network
-   * session, the new event(s) are also published to connected peers —
-   * publishing the FULL ancestor closure, not just the bare new
-   * event(s) (see AIWA.send()'s own header for both real bugs this
-   * fixes: a click made after the initial peer handshake reaching
-   * nobody, and a peer whose log doesn't yet have this channel's own
-   * causal history — commitment, progression, claim, the delegation
-   * itself — being unable to append the transfer at all).
+   * `to`. No further root-key involvement, ever — including for
+   * splitting, so this keeps working after the owner's root identity
+   * disconnects. If the owner still has a live network session, the
+   * new event(s) are also published to connected peers — publishing
+   * the FULL ancestor closure, not just the bare new event(s) (see
+   * AIWA.send()'s own header for both real bugs this fixes: a click
+   * made after the initial peer handshake reaching nobody, and a peer
+   * whose log doesn't yet have this channel's own causal history —
+   * commitment, progression, claim, the delegation itself — being
+   * unable to append the transfer at all).
+   *
+   * Private: `to` defaults to this channel's own peer for the public
+   * send() below, but the SAME real delegated-transfer mechanism has
+   * no protocol-level restriction on the destination — issueVoucher()
+   * below reuses it unchanged, addressed to a hash-locked voucher
+   * address instead of a real identity.
    */
-  async send(amount) {
+  async _sendTo(to, amount) {
     const aiwa = this._aiwa;
     const { sourceClaim, events } = await this._ensureSpendableClaim(amount);
     const signedTransfer = await buildSignedDelegatedTransferEvent(
-      this._delegation, { claimId: sourceClaim.id, to: this.peerId },
+      this._delegation, { claimId: sourceClaim.id, to },
       this._keypair.secretKey.slice(0, 32), this._keypair.publicKey.toBytes(),
     );
     const transferEvent = await createEvent(this.identity, {
@@ -562,7 +584,11 @@ export class Channel {
     await aiwa.log.append(transferEvent);
     events.push(transferEvent);
     if (aiwa.replicator) await aiwa.replicator.publish(await collectAncestors(aiwa.log, events.map((e) => e.id)));
-    return { events, newClaimId: `activated:${sourceClaim.id}:${this._delegation.from}:${this.peerId}:0:identity` };
+    return { events, newClaimId: `activated:${sourceClaim.id}:${this._delegation.from}:${to}:0:identity` };
+  }
+
+  async send(amount) {
+    return this._sendTo(this.peerId, amount);
   }
 
   /** send() plus every real ancestor event the resulting transfer needs — the identical offline mechanism AIWA.sendOfflineBundle() uses, so a channel click works over QR/NFC/Bluetooth exactly like any other send. */
@@ -570,6 +596,77 @@ export class Channel {
     const { events, newClaimId } = await this.send(amount);
     const bundle = await collectAncestors(this._aiwa.log, events.map((e) => e.id));
     return { events: bundle, newClaimId };
+  }
+
+  /**
+   * Issues a real bearer voucher THROUGH this channel — no further
+   * root-key involvement, ever, exactly like send(). Reuses _sendTo()
+   * unchanged, addressed to the hash of a fresh secret instead of a
+   * real identity: the identical, real mechanism AIWA.issueVoucher()
+   * uses, needing no new protocol here either (see aiwa-core's own
+   * wallet.js for exactly why). Returns a real, self-contained,
+   * offline-transportable blob, same shape as AIWA.issueVoucher().
+   */
+  async issueVoucher(amount) {
+    const secret = randomVoucherSecret();
+    const voucherAddress = await deriveVoucherAddress(secret);
+    const { events, newClaimId } = await this._sendTo(voucherAddress, amount);
+    const bundle = await collectAncestors(this._aiwa.log, events.map((e) => e.id));
+    return { secret, claimId: newClaimId, events: bundle };
+  }
+
+  /**
+   * Redeems a real bearer voucher THROUGH this channel, landing the
+   * value in the real owner's identity (this._delegation.from), never
+   * this channel's own session identity — see aiwa-core's own
+   * buildSignedDelegatedVoucherRedeemEvent for exactly why an ordinary
+   * voucher-redeem can't do this (it requires the real signer to
+   * derive the claimed destination directly, which a session key never
+   * does by construction) and why the SAME delegation send() already
+   * uses closes that gap here too.
+   */
+  async redeemVoucher({ secret, claimId, events }) {
+    const aiwa = this._aiwa;
+    await aiwa.log.appendMany(events);
+    const redeem = await buildSignedDelegatedVoucherRedeemEvent(
+      this._delegation, { claimId, secret },
+      this._keypair.secretKey.slice(0, 32), this._keypair.publicKey.toBytes(),
+    );
+    const redeemEvent = await createEvent(this.identity, {
+      domain: aiwa.logDomain, parents: await aiwa.log.head(), type: 'delegated-voucher-redeem', payload: redeem,
+    });
+    await aiwa.log.append(redeemEvent);
+    if (aiwa.replicator) await aiwa.replicator.publish(await collectAncestors(aiwa.log, [redeemEvent.id]));
+    return { eventId: redeemEvent.id };
+  }
+
+  /**
+   * Claims currently-claimable value into a real, spendable claim for
+   * the real owner (this._delegation.from) — through this channel,
+   * with no root-key involvement. Uses aiwa-core's own
+   * buildSignedDelegatedClaimEvent ('delegated-claim'): a channel's
+   * session key is a fresh, deterministic keypair distinct from the
+   * owner's root key (see sessionKeypairFor), so it can never satisfy
+   * aiwa-core's own domain-owner signature check on a plain 'claim'
+   * event (deriveId(signerPubkey) === domain) — the identical reason
+   * redeemVoucher() below needs 'delegated-voucher-redeem' instead of
+   * plain 'voucher-redeem'. The already-issued real delegation
+   * (this._delegation) is reused, exactly like every other Channel
+   * action here; the owner's root key never signs again.
+   */
+  async claim(amount) {
+    const aiwa = this._aiwa;
+    const claimId = crypto.randomUUID();
+    const signedClaim = await buildSignedDelegatedClaimEvent(
+      this._delegation, { claimId, amount },
+      this._keypair.secretKey.slice(0, 32), this._keypair.publicKey.toBytes(),
+    );
+    const event = await createEvent(this.identity, {
+      domain: aiwa.logDomain, parents: await aiwa.log.head(), type: 'delegated-claim', payload: signedClaim,
+    });
+    await aiwa.log.append(event);
+    if (aiwa.replicator) await aiwa.replicator.publish(await collectAncestors(aiwa.log, [event.id]));
+    return { claimId, eventId: event.id };
   }
 
   /**

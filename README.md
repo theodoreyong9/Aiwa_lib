@@ -226,6 +226,71 @@ caller here — `close()` exists for an application's own bookkeeping
 (e.g. stop showing a channel as "open" in a UI), not because it changes
 what the delegation can do.
 
+#### A channel is a real, standalone wallet once open — claim, withdraw, receive, publish too
+
+Beyond `send()`, a `Channel` also has `claim(amount)`, `issueVoucher(amount)`,
+and `redeemVoucher(voucher)` — all real, all working with zero root-key
+involvement after the channel was opened, exactly like `send()`. The
+real cost of each differed enough that they're worth being precise
+about, rather than assuming delegation covers everything uniformly:
+
+- **`channel.claim(amount)`** was first built on a real, then-existing
+  gap: aiwa-core's own `'claim'` events were not signer-scoped at the
+  reducer level (`adapt-event.js` strips `author` before any reducer
+  ever sees an event, and neither `applyWalletEvent` nor
+  `applyAccrualEvent` checked `payload.domain` against who actually
+  signed), so a channel's ordinary, validly-signed outer envelope was
+  already everything aiwa-core required. **That gap is now closed** —
+  aiwa-core's `accrual.js` requires a real signature proving the signer
+  controls the named domain (see its own README, "Honest limits") — so
+  `channel.claim()` now uses aiwa-core's new
+  `buildSignedDelegatedClaimEvent`/`'delegated-claim'` instead: the
+  identical delegation mechanism `redeemVoucher()` below already uses,
+  reusing the same already-issued `this._delegation`. The claimed value
+  still lands in the real owner's own position
+  (`this._delegation.from`), never the channel's own session identity.
+- **`channel.issueVoucher(amount)`** reuses the identical delegated-
+  transfer mechanism `send()` already uses, just addressed to a
+  hash-locked voucher address instead of a real identity — a small,
+  internal refactor (`send()`'s destination generalized into a private
+  `_sendTo(to, amount)`), no new aiwa-core protocol needed either.
+- **`channel.redeemVoucher(voucher)`** is the one that genuinely needed
+  new protocol: an ordinary `voucher-redeem` requires the real signer
+  to derive the claimed destination directly, which a channel's
+  session key never does by construction (a fresh, deterministic
+  keypair, not the owner's). aiwa-core's new
+  `buildSignedDelegatedVoucherRedeemEvent`/`'delegated-voucher-redeem'`
+  closes that gap with the identical two-signature composition
+  `delegated-transfer` already established — see aiwa-core's own
+  README for the full mechanism.
+- **Receiving** (`aiwa.receiveOfflineBundle()`) needed no channel
+  involvement at all, and no longer requires being connected either —
+  appending an already-signed incoming bundle never signs anything
+  with your own key, so the `_requireConnected()` guard on it was
+  simply unnecessary and has been removed.
+- **Publishing a contract through a channel** needs no new aiwa-lib
+  method: `channel.identity` is already a real, complete `Identity` —
+  pass it directly to `aiwa-platform`'s `publishBundle(channel.identity,
+  aiwa.log, domain, {...})` exactly as you would `aiwa.identity`.
+  **Honest limit, verified directly**: the resulting bundle's real,
+  cryptographic author is the channel's own session identity, not the
+  owner's root id — discoverable by address (the domain string
+  convention can still embed the owner's real id, e.g.
+  `contract:<owner id>:<name>`), but NOT via
+  `listBundlesByAuthor(log, ownerRootId)`, since that queries the real,
+  cryptographic `event.author`, which genuinely is the delegate here.
+  A full "delegated publish, attributed to the real owner" mechanism
+  (mirroring the delegated-voucher-redeem pattern) is real, separate,
+  not-yet-built work.
+
+```js
+// All four, through the same open channel, after aiwa.disconnect():
+await channel.claim('2.5');
+const voucher = await channel.issueVoucher('1.0');
+await channel.redeemVoucher(someOtherVoucher);
+await publishBundle(channel.identity, aiwa.log, `contract:${ownerId}:my-token`, { name: 'my-token', version: '1.0.0', files: [...] });
+```
+
 ### Bearer vouchers — a real QR you can hand to a stranger
 
 ```js
@@ -332,7 +397,7 @@ was silently rejected until this was accounted for.
 
 ## Status
 
-31 passing `node --test` cases. Depends on `aiwa-core` and
+35 passing `node --test` cases. Depends on `aiwa-core` and
 `aiwa-platform` via their GitHub URLs (none of the three are on npm
 yet).
 

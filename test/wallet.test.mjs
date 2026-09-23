@@ -444,3 +444,84 @@ test('REGRESSION: a Channel send still reaches a peer that connected BEFORE the 
   await alice.leaveNetwork();
   await bob.leaveNetwork();
 });
+
+test('receiveOfflineBundle() works on a disconnected wallet — appending never signs anything with this wallet\'s own key', async () => {
+  const alice = new AIWA({ rewardParams });
+  await alice.connect();
+  await alice.recordCommitment({ b: 100 });
+  for (let i = 0; i < 5; i++) await alice.advanceProgress({ vdfIterations: VDF_ITERATIONS });
+  const claimable = await alice.claimable();
+  await alice.claim(claimable);
+
+  const bob = new AIWA({ rewardParams });
+  const bobId = await bob.connect();
+  const bobSecretKeyBytes = bob._keypair.secretKey;
+  await bob.disconnect(); // root key + identity gone from memory
+
+  const bundle = await alice.sendOfflineBundle(bobId.identityId, claimable);
+  await assert.doesNotReject(bob.receiveOfflineBundle(bundle), 'a disconnected wallet must still be able to receive — receiving needs no signature from this wallet at all');
+
+  await bob.connect({ secretKeyBytes: bobSecretKeyBytes }); // reconnect with the SAME identity to confirm the log genuinely absorbed it while disconnected
+  assert.equal(await bob.balance(), claimable);
+});
+
+test('a channel can claim currently-claimable value for the real owner, through a real delegated-claim, landing it under the owner\'s own identity', async () => {
+  const alice = new AIWA({ rewardParams });
+  const aliceId = await alice.connect();
+  await alice.recordCommitment({ b: 100 });
+  for (let i = 0; i < 5; i++) await alice.advanceProgress({ vdfIterations: VDF_ITERATIONS });
+  const claimable = await alice.claimable();
+
+  const channel = await alice.openChannel('bob-id', { requireNetwork: false });
+  await alice.disconnect(); // root key + identity gone — the channel must not need either
+
+  await assert.doesNotReject(channel.claim(claimable));
+  assert.equal(await channel.balance(), claimable, 'the claimed value lands in the real owner\'s own position, spendable through the channel');
+
+  const state = await alice._materializeWallet();
+  assert.equal(spendableClaims(state, aliceId.identityId).length, 1, 'the real owner (not the channel\'s own session identity) owns the resulting claim');
+});
+
+test('a channel can issue a real bearer voucher — no root-key involvement — and it redeems exactly like an ordinary one', async () => {
+  const alice = new AIWA({ rewardParams });
+  await alice.connect();
+  await alice.recordCommitment({ b: 100 });
+  for (let i = 0; i < 5; i++) await alice.advanceProgress({ vdfIterations: VDF_ITERATIONS });
+  const claimable = await alice.claimable();
+  await alice.claim(claimable);
+
+  const channel = await alice.openChannel('bob-id', { requireNetwork: false });
+  await alice.disconnect();
+
+  const voucher = await channel.issueVoucher(claimable);
+  const blob = encodeOfflineBundle(voucher);
+
+  const bob = new AIWA({ rewardParams });
+  await bob.connect();
+  await bob.redeemVoucher(decodeOfflineBundle(blob));
+
+  assert.equal(await bob.balance(), claimable);
+});
+
+test('a channel can redeem a bearer voucher for the real owner, landing the value in the owner\'s identity, never the channel\'s own session identity', async () => {
+  const issuer = new AIWA({ rewardParams });
+  await issuer.connect();
+  await issuer.recordCommitment({ b: 100 });
+  for (let i = 0; i < 5; i++) await issuer.advanceProgress({ vdfIterations: VDF_ITERATIONS });
+  const claimable = await issuer.claimable();
+  await issuer.claim(claimable);
+  const voucher = await issuer.issueVoucher(claimable);
+  const blob = encodeOfflineBundle(voucher);
+
+  const owner = new AIWA({ rewardParams });
+  const ownerId = await owner.connect();
+  const channel = await owner.openChannel('someone-else-id', { requireNetwork: false });
+  await owner.disconnect(); // root key + identity gone — the channel must not need either
+
+  await assert.doesNotReject(channel.redeemVoucher(decodeOfflineBundle(blob)));
+
+  const state = await owner._materializeWallet();
+  assert.equal(spendableClaims(state, ownerId.identityId).length, 1, 'the real owner receives it');
+  assert.equal(spendableClaims(state, ownerId.identityId)[0].amount, toUnits(claimable));
+  assert.equal(spendableClaims(state, channel.identity.id).length, 0, 'the channel\'s own session identity never actually owns the redeemed value');
+});
