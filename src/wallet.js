@@ -37,7 +37,18 @@ import {
   deriveKeypairFromBip39Mnemonic, keypairFromSecretKey, loadSolanaWeb3, toIdentity,
   broadcastBurnTransaction, SOLANA_INCINERATOR_ADDRESS, vdfSeed, computeVdfChain,
   issueDelegation, buildSignedDelegatedTransferEvent, buildSignedDelegatedSplitEvent,
+  deriveVoucherAddress, buildSignedVoucherRedeemEvent,
 } from 'aiwa-core';
+
+// A real, cryptographically random secret — 32 bytes, hex-encoded.
+// This is what a voucher's QR code actually carries; whoever can
+// reveal it first genuinely redeems the real value it hash-locks (see
+// aiwa-core's own wallet.js for the full scheme).
+function randomVoucherSecret() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
 import { Replicator } from 'aiwa-platform';
 import { collectAncestors } from './ancestors.js';
 
@@ -363,6 +374,53 @@ export class AIWA {
   async receiveOfflineBundle(bundle) {
     this._requireConnected();
     await this.log.appendMany(bundle.events);
+  }
+
+  /**
+   * Issues a real bearer voucher: hash-locks `amount` of your own
+   * already-owned value behind a fresh, random secret (aiwa-core's own
+   * deriveVoucherAddress/'voucher-redeem' — the same idea a Lightning
+   * HTLC or a Bitcoin pay-to-hash-of-a-preimage script uses). Reuses
+   * send() as-is — nothing here validates that a recipient is a real
+   * identity, so issuing needs no new signing logic at all; the
+   * voucher address is just an ordinary transfer destination nobody's
+   * root key happens to control.
+   *
+   * Returns a real, self-contained, offline-transportable blob — put
+   * `secret` (and `claimId`/`events`) in a QR code, share it, whatever:
+   * whoever redeems it FIRST genuinely gets the value. The QR can be
+   * copied; only the first real redemption succeeds — see aiwa-core's
+   * own wallet.js for exactly why (its existing single-writer
+   * conservation invariant, not new double-spend logic).
+   */
+  async issueVoucher(amount) {
+    this._requireConnected();
+    const secret = randomVoucherSecret();
+    const voucherAddress = await deriveVoucherAddress(secret);
+    const { events, newClaimId } = await this.send(voucherAddress, amount);
+    const bundle = await collectAncestors(this.log, events.map((e) => e.id));
+    return { secret, claimId: newClaimId, events: bundle };
+  }
+
+  /**
+   * Redeems a real bearer voucher (from issueVoucher(), or received
+   * with zero prior sync — the identical offline mechanism
+   * receiveOfflineBundle() uses) into your own, real identity. Whoever
+   * redeems first genuinely gets it; redeeming an already-consumed
+   * voucher has no real effect.
+   */
+  async redeemVoucher({ secret, claimId, events }) {
+    this._requireConnected();
+    await this.log.appendMany(events);
+    const redeem = await buildSignedVoucherRedeemEvent(
+      { claimId, secret, to: this.identity.id },
+      this._keypair.secretKey.slice(0, 32), this._keypair.publicKey.toBytes(),
+    );
+    const redeemEvent = await createEvent(this.identity, {
+      domain: this.logDomain, parents: await this.log.head(), type: 'voucher-redeem', payload: redeem,
+    });
+    await this.log.append(redeemEvent);
+    return { eventId: redeemEvent.id };
   }
 
   // --- Live network (separate from connect()/disconnect() above) ---

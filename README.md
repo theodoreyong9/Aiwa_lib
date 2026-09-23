@@ -65,6 +65,17 @@ const bundle = await aiwa.sendOfflineBundle(recipientIdentityId, '1.0');
 const blob = encodeOfflineBundle(bundle); // a compact string — put this in a QR code
 // ...recipient scans it, decodes, and appends it, offline, on their own device:
 await theirAiwa.receiveOfflineBundle(decodeOfflineBundle(blob));
+
+// A real BEARER voucher — unlike send*, the recipient is unknown until
+// redemption time: whoever redeems first genuinely gets it, and the
+// QR/blob can be freely copied, since only the first redemption
+// succeeds (aiwa-core's own hash-lock: deriveVoucherAddress/
+// 'voucher-redeem'). No pre-funding, no escrow account — issuing is an
+// ordinary transfer to the hash of a fresh, random secret.
+const voucher = await aiwa.issueVoucher('5.0');
+const voucherBlob = encodeOfflineBundle(voucher); // put THIS in the withdrawal QR
+// ...whoever scans it, decodes, and redeems it into THEIR OWN identity:
+await someoneElsesAiwa.redeemVoucher(decodeOfflineBundle(voucherBlob));
 ```
 
 ### The offline send/receive path — the real killer feature, honestly scoped
@@ -174,6 +185,33 @@ caller here — `close()` exists for an application's own bookkeeping
 (e.g. stop showing a channel as "open" in a UI), not because it changes
 what the delegation can do.
 
+### Bearer vouchers — a real QR you can hand to a stranger
+
+```js
+const voucher = await aiwa.issueVoucher('5.0'); // hash-locks 5.0 behind a fresh, random secret — zero pre-funding, zero escrow
+const blob = encodeOfflineBundle(voucher); // this is the QR code
+await theirAiwa.redeemVoucher(decodeOfflineBundle(blob)); // whoever scans it first genuinely gets it
+```
+
+Unlike `send*`/`Channel`, the recipient is unknown until redemption —
+issuing is an ordinary, already-existing signed transfer to the hash
+of a secret (`aiwa-core`'s own `deriveVoucherAddress`), never a real
+identity, so it needs no new protocol at all. "The QR can be copied,
+but only the first redemption succeeds" isn't new double-spend logic
+either — it falls straight out of `conservation.js`'s own existing
+single-writer invariant (a second redemption's `deactivate()` throws
+on an already-consumed claim, rejected exactly like a replayed
+transfer).
+
+**Honest limit, stated plainly, same as `sendOfflineBundle`**: this is
+real double-spend *detection* via reconciliation, not real-time
+*prevention*. Two people can each honestly, offline, redeem the
+identical voucher — both believe they succeeded until their logs sync
+with each other or the issuer; the conflict resolves only then, to
+exactly one winner. Verified directly in this repo's own test suite
+("two real wallets, each honestly redeeming the identical voucher
+offline, converge to exactly one winner once synced").
+
 ## The smart-contract/token authoring SDK
 
 ```js
@@ -253,7 +291,7 @@ was silently rejected until this was accounted for.
 
 ## Status
 
-25 passing `node --test` cases. Depends on `aiwa-core` and
+27 passing `node --test` cases. Depends on `aiwa-core` and
 `aiwa-platform` via their GitHub URLs (none of the three are on npm
 yet).
 

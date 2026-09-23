@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spendableClaims } from 'aiwa-core';
+import { spendableClaims, EventLog } from 'aiwa-core';
 import { AIWA, encodeOfflineBundle, decodeOfflineBundle, fromUnits, toUnits } from '../src/wallet.js';
 
 // The same real test economic parameters aiwa-core's own test suite
@@ -262,4 +262,67 @@ test('a channel keeps working — balance() AND a real split — after the owner
   const state = await alice._materializeWallet();
   const bobClaims = spendableClaims(state, 'bob-id');
   assert.equal(bobClaims.length, 2, 'two real, independent delegated sends, each needing its own real, delegate-signed split — no root key involved for either');
+});
+
+test('a real bearer voucher: "the QR can be copied, but only the first redemption succeeds"', async () => {
+  const alice = new AIWA({ rewardParams });
+  await alice.connect();
+  await alice.recordCommitment({ b: 100 });
+  for (let i = 0; i < 5; i++) await alice.advanceProgress({ vdfIterations: VDF_ITERATIONS });
+  const claimable = await alice.claimable();
+  await alice.claim(claimable);
+
+  const voucher = await alice.issueVoucher(claimable);
+  assert.ok(voucher.secret.length >= 32, 'a real, long random secret — this is what goes in the QR code');
+
+  // Encoded/decoded exactly like any other offline bundle — the same
+  // compact, transportable format, zero prior sync required.
+  const blob = encodeOfflineBundle(voucher);
+  const decoded = decodeOfflineBundle(blob);
+
+  const bob = new AIWA({ rewardParams });
+  const { identityId: bobId } = await bob.connect();
+  await bob.redeemVoucher(decoded);
+
+  assert.equal(await bob.balance(), claimable);
+  assert.equal(await bob.spendableBalance(), claimable, 'a real, immediately spendable claim — not just claimable');
+});
+
+test('SECURITY: a real "only once" property through the wallet API — two real wallets, each honestly redeeming the identical voucher offline, converge to exactly one winner once synced', async () => {
+  const alice = new AIWA({ rewardParams });
+  await alice.connect();
+  await alice.recordCommitment({ b: 100 });
+  for (let i = 0; i < 5; i++) await alice.advanceProgress({ vdfIterations: VDF_ITERATIONS });
+  const claimable = await alice.claimable();
+  await alice.claim(claimable);
+
+  const voucher = await alice.issueVoucher(claimable);
+  const blob = encodeOfflineBundle(voucher);
+
+  const bob = new AIWA({ rewardParams });
+  const { identityId: bobId } = await bob.connect();
+  const carol = new AIWA({ rewardParams });
+  const { identityId: carolId } = await carol.connect();
+
+  // Both scanned the identical QR, both fully offline — each locally
+  // believes their own redemption succeeded (this is the SAME
+  // real, documented, offline-first "detection via reconciliation, not
+  // real-time prevention" limit this README already states — a real
+  // conflict only surfaces once they sync, exactly like a duplicated
+  // paper check). What matters is what a REAL sync between them
+  // (or with alice) resolves to.
+  await bob.redeemVoucher(decodeOfflineBundle(blob));
+  await carol.redeemVoucher(decodeOfflineBundle(blob));
+
+  const mergedLog = new EventLog();
+  for (const log of [bob.log, carol.log]) {
+    const events = await Promise.all((await log.backend.allIds()).map((id) => log.get(id)));
+    await mergedLog.appendMany(events);
+  }
+  const merged = new AIWA({ rewardParams, backend: mergedLog.backend });
+  const state = await merged._materializeWallet();
+
+  const bobGotIt = spendableClaims(state, bobId).length === 1;
+  const carolGotIt = spendableClaims(state, carolId).length === 1;
+  assert.notEqual(bobGotIt, carolGotIt, 'exactly one of the two real redemptions survives a real sync — never both, never neither');
 });
