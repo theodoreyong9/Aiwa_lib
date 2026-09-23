@@ -291,9 +291,23 @@ was silently rejected until this was accounted for.
 
 ## Status
 
-27 passing `node --test` cases. Depends on `aiwa-core` and
+29 passing `node --test` cases. Depends on `aiwa-core` and
 `aiwa-platform` via their GitHub URLs (none of the three are on npm
 yet).
+
+**Fixed a real bug this pass**: `AIWA.send()` and `Channel.send()`
+appended the new transfer event to the local log but never called
+`aiwa-platform`'s `Replicator.publish(events)` — so a send made
+*after* a peer was already connected silently never reached them.
+`Replicator` only syncs automatically via a one-time `HELLO`/
+`HELLO_ACK` handshake at the moment two peers join the same room; it
+has no mechanism that re-syncs on its own afterward. Both methods now
+call `replicator.publish(events)` right after appending, and
+`test/wallet.test.mjs` has two `REGRESSION:` tests (using
+`aiwa-platform`'s `LoopbackTransport` for a deterministic, in-memory
+two-peer connection) that connect two wallets first and only then
+send, confirming the recipient's balance actually updates — the exact
+case that was silently broken before.
 
 ## Testing
 

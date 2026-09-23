@@ -302,6 +302,16 @@ export class AIWA {
    * Sends `amount` (decimal string) of already-claimed AIWA to
    * `toIdentityId`, real signature and all. Splits an existing claim
    * first if none matches the amount exactly (see _ensureSpendableClaim).
+   *
+   * If a live network session is active (joinNetwork()), the new
+   * event(s) are also published to every currently-connected peer —
+   * REAL BUG, FOUND LIVE: Replicator's own HELLO/HELLO_ACK exchange
+   * only syncs once, at the moment two peers connect; nothing
+   * automatically re-syncs afterward. A send() made after that initial
+   * handshake, with no explicit replicator.publish() call, reached
+   * nobody — the recipient's balance simply never moved, silently.
+   * "Send over the network" was never actually verified end to end
+   * before this was found.
    */
   async send(toIdentityId, amount) {
     this._requireConnected();
@@ -316,6 +326,7 @@ export class AIWA {
     });
     await this.log.append(transferEvent);
     events.push(transferEvent);
+    if (this.replicator) await this.replicator.publish(events);
 
     return { events, newClaimId: `activated:${sourceClaim.id}:${this.identity.id}:${toIdentityId}:0:identity` };
   }
@@ -509,7 +520,16 @@ export class Channel {
     return { sourceClaim, events };
   }
 
-  /** "Click to send" — a real, delegate-signed transfer of `amount` to this channel's own peer. No further root-key involvement, ever — including for splitting, so this keeps working after the owner's root identity disconnects. */
+  /**
+   * "Click to send" — a real, delegate-signed transfer of `amount` to
+   * this channel's own peer. No further root-key involvement, ever —
+   * including for splitting, so this keeps working after the owner's
+   * root identity disconnects. If the owner still has a live network
+   * session, the new event(s) are also published to connected peers
+   * (see AIWA.send()'s own header for the real bug this fixes: without
+   * this, a click made after the initial peer handshake reached
+   * nobody, silently).
+   */
   async send(amount) {
     const aiwa = this._aiwa;
     const { sourceClaim, events } = await this._ensureSpendableClaim(amount);
@@ -522,6 +542,7 @@ export class Channel {
     });
     await aiwa.log.append(transferEvent);
     events.push(transferEvent);
+    if (aiwa.replicator) await aiwa.replicator.publish(events);
     return { events, newClaimId: `activated:${sourceClaim.id}:${this._delegation.from}:${this.peerId}:0:identity` };
   }
 

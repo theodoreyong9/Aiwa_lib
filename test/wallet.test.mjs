@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spendableClaims, EventLog } from 'aiwa-core';
+import { LoopbackTransport } from 'aiwa-platform';
 import { AIWA, encodeOfflineBundle, decodeOfflineBundle, fromUnits, toUnits } from '../src/wallet.js';
 
 // The same real test economic parameters aiwa-core's own test suite
@@ -325,4 +326,50 @@ test('SECURITY: a real "only once" property through the wallet API — two real 
   const bobGotIt = spendableClaims(state, bobId).length === 1;
   const carolGotIt = spendableClaims(state, carolId).length === 1;
   assert.notEqual(bobGotIt, carolGotIt, 'exactly one of the two real redemptions survives a real sync — never both, never neither');
+});
+
+test('REGRESSION: send() over a live network session actually reaches an already-connected peer — it silently did not before this fix', async () => {
+  const alice = new AIWA({ rewardParams });
+  const aliceId = await alice.connect();
+  const bob = new AIWA({ rewardParams });
+  const bobId = await bob.connect();
+
+  await alice.recordCommitment({ b: 100 });
+  for (let i = 0; i < 5; i++) await alice.advanceProgress({ vdfIterations: VDF_ITERATIONS });
+  const claimable = await alice.claimable();
+  await alice.claim(claimable);
+
+  // Both join and complete their real, one-time HELLO handshake BEFORE
+  // the send below — the exact ordering that exposed the real bug:
+  // Replicator never re-syncs after this initial exchange on its own.
+  await alice.joinNetwork(new LoopbackTransport(aliceId.identityId));
+  await bob.joinNetwork(new LoopbackTransport(bobId.identityId));
+  await new Promise((r) => setTimeout(r, 50)); // let the real HELLO/HELLO_ACK exchange settle
+
+  await alice.send(bobId.identityId, claimable);
+  await new Promise((r) => setTimeout(r, 50)); // let the real EVENTS/ACK round trip settle
+
+  assert.equal(await bob.balance(), claimable, 'a send() made after the peers already connected must still reach bob — it did not before replicator.publish() was wired in');
+});
+
+test('REGRESSION: a Channel send over a live network session also reaches an already-connected peer', async () => {
+  const alice = new AIWA({ rewardParams });
+  const aliceId = await alice.connect();
+  const bob = new AIWA({ rewardParams });
+  const bobId = await bob.connect();
+
+  await alice.recordCommitment({ b: 100 });
+  for (let i = 0; i < 5; i++) await alice.advanceProgress({ vdfIterations: VDF_ITERATIONS });
+  const claimable = await alice.claimable();
+  await alice.claim(claimable);
+
+  await alice.joinNetwork(new LoopbackTransport(aliceId.identityId));
+  await bob.joinNetwork(new LoopbackTransport(bobId.identityId));
+  await new Promise((r) => setTimeout(r, 50));
+
+  const channel = await alice.openChannel(bobId.identityId);
+  await channel.send(claimable);
+  await new Promise((r) => setTimeout(r, 50));
+
+  assert.equal(await bob.balance(), claimable, 'a channel click made after the peers already connected must still reach bob');
 });
