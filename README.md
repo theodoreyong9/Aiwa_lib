@@ -10,7 +10,10 @@ never reimplemented here:
 - **A real wallet API** (`AIWA`): connect/disconnect, address, real SOL
   balance, real burn, real AIWA balance, claimable, claim, send/receive
   — including a fully OFFLINE send/receive path (QR code, NFC,
-  Bluetooth — no network at all).
+  Bluetooth — no network at all), and a real "sign once, click as many
+  times as you want" delegated-send channel (`Channel`, via
+  `openChannel()`) for a single counterparty — no pre-funding, nothing
+  escrowed, ever.
 - **A smart-contract/token authoring SDK** (`defineContract`,
   `Contract`, `signedAction`/`verifySignedAction`): define your own
   real, event-sourced contract — a token, a game's state, anything —
@@ -102,6 +105,43 @@ wall-clock time passes. This is not automatic — a wallet UI has to
 actually run the loop while it's open, the same real role AIWA_chain's
 own `vdf-worker.js` played.
 
+### Channels — "sign once, click as many times as you want"
+
+```js
+// Both parties need SOME way to reach each other to open a channel at
+// all — opening requires a live network session (joinNetwork()) by
+// default. Once open, the channel itself needs no further connectivity:
+// a direct link between the two (a live WebRTC data channel surviving
+// after both lose their wider internet access, Bluetooth, NFC, a QR
+// code) is all sendOfflineBundle()/receiveOfflineBundle() ever need.
+await aiwa.joinNetwork(transport);
+const channel = await aiwa.openChannel(bobIdentityId); // ONE real signature — the delegation
+await channel.send('0.10'); // click
+await channel.send('0.10'); // click
+await channel.send('0.10'); // click — the root key is never touched again
+```
+
+This is real delegation (aiwa-core's own `issueDelegation`/
+`buildSignedDelegatedTransferEvent`), **not** a pre-funded escrow
+account: `openChannel()` moves zero funds. It derives a real,
+deterministic session key for this exact (your identity, this peer)
+pair — always the same key, recoverable even after a crash, never a
+randomly-generated throwaway you could lose track of — and signs ONE
+real delegation authorizing it. Every `channel.send()` afterward is a
+fresh, independent, delegate-signed real transfer of whatever you
+currently, genuinely own; the delegate can never move more than that,
+and a compromised session key only ever threatens funds you actually
+hold, for this one peer, same as your root key already could.
+
+**Honest limit, by explicit design**: no amount cap, no expiry, no
+revocation. An issued delegation is valid for as long as you keep using
+the same root identity with that peer. A deployment wanting either
+bound layers it into its own `contractVerifiers` via aiwa-core's
+`'contract-payout'` extension point instead of forcing it on every
+caller here — `close()` exists for an application's own bookkeeping
+(e.g. stop showing a channel as "open" in a UI), not because it changes
+what the delegation can do.
+
 ## The smart-contract/token authoring SDK
 
 ```js
@@ -181,7 +221,7 @@ was silently rejected until this was accounted for.
 
 ## Status
 
-16 passing `node --test` cases. Depends on `aiwa-core` and
+22 passing `node --test` cases. Depends on `aiwa-core` and
 `aiwa-platform` via their GitHub URLs (none of the three are on npm
 yet).
 

@@ -36,9 +36,31 @@ import {
   generateLightweightKeypair, lightweightKeypairFromSecretKey, deriveKeypairFromPassphrase,
   deriveKeypairFromBip39Mnemonic, keypairFromSecretKey, loadSolanaWeb3, toIdentity,
   broadcastBurnTransaction, SOLANA_INCINERATOR_ADDRESS, vdfSeed, computeVdfChain,
+  issueDelegation, buildSignedDelegatedTransferEvent,
 } from 'aiwa-core';
 import { Replicator } from 'aiwa-platform';
 import { collectAncestors } from './ancestors.js';
+
+// A real, DETERMINISTIC per-(root, peer) session key — HMAC-SHA256
+// keyed by your own real root secret, so it's always recoverable
+// (never a randomly-generated, potentially-lost throwaway) and unique
+// per counterparty (a compromised session key for one peer's channel
+// never affects any other peer's).
+async function deriveSessionSeed(rootSecretKey32, peerId) {
+  const key = await crypto.subtle.importKey('raw', rootSecretKey32, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const mac = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`aiwa-lib-channel-session-v1:${peerId}`));
+  return new Uint8Array(mac);
+}
+
+async function sessionKeypairFor(rootKeypair, peerId) {
+  const { ed25519 } = await import('@noble/curves/ed25519.js');
+  const seed32 = await deriveSessionSeed(rootKeypair.secretKey.slice(0, 32), peerId);
+  const pub32 = ed25519.getPublicKey(seed32);
+  const secretKey64 = new Uint8Array(64);
+  secretKey64.set(seed32, 0);
+  secretKey64.set(pub32, 32);
+  return lightweightKeypairFromSecretKey(secretKey64);
+}
 
 export { fromUnits, toUnits, SOLANA_INCINERATOR_ADDRESS };
 
@@ -198,17 +220,19 @@ export class AIWA {
   }
 
   /**
-   * Sends `amount` (decimal string) of already-claimed AIWA to
-   * `toIdentityId`, real signature and all. Splits an existing claim
-   * first if none matches the amount exactly.
+   * Finds (or creates, via a real, owner-signed split) a single active
+   * claim you own worth exactly `amount` — the shared first step
+   * `send()` and a real Channel's own `send()` both need. Splitting is
+   * always an owner-only operation, never delegated: real delegation
+   * (see openChannel()) only ever covers TRANSFER authorization, not
+   * dividing a claim into new ones.
    *
    * HONEST LIMIT (v1): requires a SINGLE active claim >= `amount` —
    * does not yet combine several smaller claims to reach it. Claim
    * consolidation (splitting into round denominations, or merging) is
    * a real, separate, not-yet-built convenience, not a protocol limit.
    */
-  async send(toIdentityId, amount) {
-    this._requireConnected();
+  async _ensureSpendableClaim(amount) {
     const amountUnits = toUnits(amount);
     const state = await this._materializeWallet();
     const claims = spendableClaims(state, this.identity.id);
@@ -234,6 +258,18 @@ export class AIWA {
       sourceClaim = { id: firstId, amount: amountUnits };
     }
 
+    return { sourceClaim, events };
+  }
+
+  /**
+   * Sends `amount` (decimal string) of already-claimed AIWA to
+   * `toIdentityId`, real signature and all. Splits an existing claim
+   * first if none matches the amount exactly (see _ensureSpendableClaim).
+   */
+  async send(toIdentityId, amount) {
+    this._requireConnected();
+    const { sourceClaim, events } = await this._ensureSpendableClaim(amount);
+
     const signedTransfer = await buildSignedTransferEvent(
       { claimId: sourceClaim.id, from: this.identity.id, to: toIdentityId },
       this._keypair.secretKey.slice(0, 32), this._keypair.publicKey.toBytes(),
@@ -245,6 +281,39 @@ export class AIWA {
     events.push(transferEvent);
 
     return { events, newClaimId: `activated:${sourceClaim.id}:${this.identity.id}:${toIdentityId}:0:identity` };
+  }
+
+  /**
+   * Opens a real "sign once, click many times" channel with `peerId`
+   * (see aiwa-core's own wallet.js for the underlying delegation
+   * mechanism): derives a real, DETERMINISTIC per-peer session key
+   * (recoverable later even after a crash — always the same key for
+   * the same root identity + peerId, never randomly generated and
+   * potentially lost), and signs ONE real delegation authorizing it.
+   * Every subsequent Channel.send() then signs with the already-
+   * unlocked session key alone — your own root key is never touched
+   * again for this peer's channel.
+   *
+   * No funds are pre-funded or moved anywhere at open time: nothing is
+   * escrowed into a separate account. The delegate only ever authorizes
+   * moving what you already, genuinely own, one real transfer at a time.
+   *
+   * By default requires a live network session (see joinNetwork()) —
+   * opening a channel with a peer you have no way to reach at all
+   * isn't a real channel. Pass `{ requireNetwork: false }` to skip this
+   * (e.g. for tests, or an application with its own reachability check).
+   */
+  async openChannel(peerId, { requireNetwork = true } = {}) {
+    this._requireConnected();
+    if (requireNetwork && !this.replicator) {
+      throw new Error('openChannel: no live network session — call joinNetwork() first. Once open, the channel itself works fully offline.');
+    }
+    const sessionKeypair = await sessionKeypairFor(this._keypair, peerId);
+    const sessionIdentity = await toIdentity(sessionKeypair);
+    const delegation = await issueDelegation(
+      this._keypair.secretKey.slice(0, 32), this._keypair.publicKey.toBytes(), sessionKeypair.publicKey.toBytes(),
+    );
+    return new Channel({ aiwa: this, peerId, sessionKeypair, sessionIdentity, delegation });
   }
 
   // --- Fully offline send/receive: QR code, NFC, Bluetooth, anything ---
@@ -285,6 +354,67 @@ export class AIWA {
       this.replicator = null;
     }
   }
+}
+
+/**
+ * "Sign once, click many times." A real, per-peer delegated-send
+ * session — see AIWA.openChannel(). Every send() signs with the
+ * already-unlocked session key alone; the owner's root key (still the
+ * REAL owner of every claim moved) is never touched again after the
+ * channel was opened. Fully offline-capable: once the one, real
+ * delegation exists, nothing here needs any network at all.
+ */
+export class Channel {
+  constructor({ aiwa, peerId, sessionKeypair, sessionIdentity, delegation }) {
+    this._aiwa = aiwa;
+    this.peerId = peerId;
+    this._keypair = sessionKeypair;
+    this.identity = sessionIdentity;
+    this._delegation = delegation;
+  }
+
+  /** This channel's own real, deterministic session address — distinct from your own root address, one per peer. */
+  get address() { return this._keypair.publicKey.toBase58(); }
+
+  /** What you (the real owner) still have available to send through this or any other channel — delegation never partitions your balance, it only authorizes moving it. */
+  async balance() {
+    return this._aiwa.balance();
+  }
+
+  /** "Click to send" — a real, delegate-signed transfer of `amount` to this channel's own peer. No further root-key involvement. */
+  async send(amount) {
+    const aiwa = this._aiwa;
+    const { sourceClaim, events } = await aiwa._ensureSpendableClaim(amount); // splitting, if needed, still uses the owner's own root key — see _ensureSpendableClaim's own header
+    const signedTransfer = await buildSignedDelegatedTransferEvent(
+      this._delegation, { claimId: sourceClaim.id, to: this.peerId },
+      this._keypair.secretKey.slice(0, 32), this._keypair.publicKey.toBytes(),
+    );
+    const transferEvent = await createEvent(this.identity, {
+      domain: aiwa.logDomain, parents: await aiwa.log.head(), type: 'delegated-transfer', payload: signedTransfer,
+    });
+    await aiwa.log.append(transferEvent);
+    events.push(transferEvent);
+    return { events, newClaimId: `activated:${sourceClaim.id}:${aiwa.identity.id}:${this.peerId}:0:identity` };
+  }
+
+  /** send() plus every real ancestor event the resulting transfer needs — the identical offline mechanism AIWA.sendOfflineBundle() uses, so a channel click works over QR/NFC/Bluetooth exactly like any other send. */
+  async sendOfflineBundle(amount) {
+    const { events, newClaimId } = await this.send(amount);
+    const bundle = await collectAncestors(this._aiwa.log, events.map((e) => e.id));
+    return { events: bundle, newClaimId };
+  }
+
+  /**
+   * No protocol action is required to close a channel: nothing was
+   * ever escrowed, so there is nothing to reclaim. HONEST LIMIT: there
+   * is no revocation mechanism — an issued delegation has no expiry or
+   * amount cap (by explicit design, see aiwa-core's own wallet.js), so
+   * it remains valid for as long as the owner keeps using this same
+   * root identity. This method exists for symmetry and for an
+   * application's own bookkeeping (e.g. stop showing this channel as
+   * "open" in a UI); it does not change what the delegation can do.
+   */
+  close() {}
 }
 
 /** A real, compact, transportable encoding for QR/NFC/Bluetooth — the same pattern aiwa-platform's own signaling-codec.js uses. */

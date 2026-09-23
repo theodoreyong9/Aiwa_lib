@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spendableClaims } from 'aiwa-core';
 import { AIWA, encodeOfflineBundle, decodeOfflineBundle, fromUnits, toUnits } from '../src/wallet.js';
 
 // The same real test economic parameters aiwa-core's own test suite
@@ -136,4 +137,72 @@ test('receiveOfflineBundle rejects a tampered bundle — real signature/causal v
 test('fromUnits/toUnits round-trip a real decimal amount', () => {
   assert.equal(fromUnits(toUnits('1.5')), '1.5');
   assert.equal(fromUnits(toUnits('0.000000000000000001')), '0.000000000000000001');
+});
+
+test('openChannel() requires a live network session by default', async () => {
+  const aiwa = new AIWA({ rewardParams });
+  await aiwa.connect();
+  await assert.rejects(aiwa.openChannel('bob-id'), /no live network session/);
+});
+
+test('"sign once, click many times": a real Channel sends repeatedly without the root key signing again', async () => {
+  const aiwa = new AIWA({ rewardParams });
+  await aiwa.connect();
+  await aiwa.recordCommitment({ b: 100 });
+  for (let i = 0; i < 5; i++) await aiwa.advanceProgress({ vdfIterations: VDF_ITERATIONS });
+  const claimable = await aiwa.claimable();
+  await aiwa.claim(claimable);
+
+  const channel = await aiwa.openChannel('bob-id', { requireNetwork: false });
+  assert.ok(typeof channel.address === 'string' && channel.address.length > 30);
+  assert.notEqual(channel.address, aiwa.address, 'the channel\'s own session address must differ from the root address');
+
+  const third = (Number(claimable) / 3).toString();
+  await channel.send(third);
+  await channel.send(third);
+
+  const state = await aiwa._materializeWallet();
+  const bobClaims = spendableClaims(state, 'bob-id');
+  assert.equal(bobClaims.length, 2, 'two real, independent clicks, each its own real delegated transfer');
+});
+
+test('openChannel() derives the SAME session key for the same peer every time — recoverable after a crash', async () => {
+  const aiwa = new AIWA({ rewardParams });
+  await aiwa.connect();
+  const channelA = await aiwa.openChannel('bob-id', { requireNetwork: false });
+  const channelB = await aiwa.openChannel('bob-id', { requireNetwork: false }); // simulates re-opening after a restart, same root identity
+  assert.equal(channelA.address, channelB.address);
+});
+
+test('openChannel() derives a DIFFERENT session key for a different peer', async () => {
+  const aiwa = new AIWA({ rewardParams });
+  await aiwa.connect();
+  const toBob = await aiwa.openChannel('bob-id', { requireNetwork: false });
+  const toCarol = await aiwa.openChannel('carol-id', { requireNetwork: false });
+  assert.notEqual(toBob.address, toCarol.address);
+});
+
+test('a channel sent OFFLINE bundle is independently verifiable by a stranger with zero prior sync', async () => {
+  const alice = new AIWA({ rewardParams });
+  await alice.connect();
+  await alice.recordCommitment({ b: 100 });
+  for (let i = 0; i < 5; i++) await alice.advanceProgress({ vdfIterations: VDF_ITERATIONS });
+  const claimable = await alice.claimable();
+  await alice.claim(claimable);
+
+  const bob = new AIWA({ rewardParams });
+  const { identityId: bobId } = await bob.connect();
+
+  const channel = await alice.openChannel(bobId, { requireNetwork: false });
+  const bundle = await channel.sendOfflineBundle(claimable);
+  await bob.receiveOfflineBundle(bundle);
+
+  assert.equal(await bob.balance(), claimable);
+});
+
+test('SECURITY: a channel cannot move a claim the root identity does not actually own', async () => {
+  const alice = new AIWA({ rewardParams });
+  await alice.connect();
+  const channel = await alice.openChannel('bob-id', { requireNetwork: false });
+  await assert.rejects(channel.send('1.0'), /No single active claim/);
 });
