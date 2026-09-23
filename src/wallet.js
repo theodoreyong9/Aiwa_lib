@@ -118,11 +118,21 @@ export class AIWA {
     return connection.getBalance(keypair.publicKey);
   }
 
-  /** A real, irreversible burn to Solana's own incinerator address — the real activation cost this deployment's identity-cost.js verifies. Returns the real transaction signature. */
+  /**
+   * A real, irreversible burn to Solana's own incinerator address — the
+   * real activation cost this deployment's identity-cost.js verifies.
+   * Atomically also commits the burned amount as real capital via
+   * recordCommitment() (matching AIWA_chain's own original ignition.js:
+   * one action, "burn & ignite" — the same key that holds SOL is the
+   * key AIWA accrues to, there is no separate commit step to forget).
+   * Returns the real transaction signature.
+   */
   async burn(lamports, connection) {
     const solanaWeb3 = await loadSolanaWeb3();
     const keypair = await this.solanaKeypair();
-    return broadcastBurnTransaction(solanaWeb3, connection, keypair, lamports);
+    const signature = await broadcastBurnTransaction(solanaWeb3, connection, keypair, lamports);
+    await this.recordCommitment({ b: lamports / 1e9 });
+    return signature;
   }
 
   // --- Local AIWA ledger (fully offline; identical whether or not joinNetwork() is active) ---

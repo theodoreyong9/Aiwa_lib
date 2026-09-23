@@ -42,10 +42,14 @@ const { address, identityId } = await aiwa.connect(); // or connect({ mnemonic }
 // Real, on-chain Solana calls — you provide the real Connection; this
 // library never picks an RPC endpoint for you.
 const lamports = await aiwa.solBalance(connection);
-const signature = await aiwa.burn(lamports, connection); // to Solana's own real incinerator address
+// One atomic action, matching AIWA_chain's own original ignition.js
+// ("burn & ignite"): burns to Solana's own real incinerator address,
+// then immediately records the exact burned amount as real committed
+// capital (recordCommitment({ b: lamports / 1e9 })) — there is no
+// separate commit step to forget.
+const signature = await aiwa.burn(lamports, connection);
 
 // Local AIWA ledger — fully offline, identical whether or not joinNetwork() is active.
-await aiwa.recordCommitment({ b: 10 }); // commits real capital, after a real burn
 await aiwa.startProgressLoop(); // advances your own real progression epoch on a timer — this is what makes claimable() actually grow
 const claimable = await aiwa.claimable(); // decimal string, e.g. "1.5"
 await aiwa.claim(claimable);
