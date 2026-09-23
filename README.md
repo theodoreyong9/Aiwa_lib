@@ -268,10 +268,17 @@ about, rather than assuming delegation covers everything uniformly:
   appending an already-signed incoming bundle never signs anything
   with your own key, so the `_requireConnected()` guard on it was
   simply unnecessary and has been removed.
-- **Publishing a contract through a channel** needs no new aiwa-lib
-  method: `channel.identity` is already a real, complete `Identity` —
-  pass it directly to `aiwa-platform`'s `publishBundle(channel.identity,
-  aiwa.log, domain, {...})` exactly as you would `aiwa.identity`.
+- **Publishing a contract through a channel** needs almost no new
+  aiwa-lib surface: `channel.identity` is already a real, complete
+  `Identity` — pass it directly to `aiwa-platform`'s
+  `publishBundle(channel.identity, channel.log, domain, {...})`
+  exactly as you would `aiwa.identity`/`aiwa.log`. The one real
+  addition is `channel.log` itself (a thin getter over the same
+  `EventLog` the owner's own `AIWA` instance uses) — needed because
+  `aiwa.log` genuinely stops being reachable once the app's own
+  reference to a disconnected `AIWA` instance is dropped, even though
+  the underlying log itself was never tied to connection state (see
+  `receiveOfflineBundle()`'s own note above).
   **Honest limit, verified directly**: the resulting bundle's real,
   cryptographic author is the channel's own session identity, not the
   owner's root id — discoverable by address (the domain string
@@ -288,7 +295,7 @@ about, rather than assuming delegation covers everything uniformly:
 await channel.claim('2.5');
 const voucher = await channel.issueVoucher('1.0');
 await channel.redeemVoucher(someOtherVoucher);
-await publishBundle(channel.identity, aiwa.log, `contract:${ownerId}:my-token`, { name: 'my-token', version: '1.0.0', files: [...] });
+await publishBundle(channel.identity, channel.log, `contract:${ownerId}:my-token`, { name: 'my-token', version: '1.0.0', files: [...] });
 ```
 
 ### Bearer vouchers — a real QR you can hand to a stranger
@@ -397,7 +404,7 @@ was silently rejected until this was accounted for.
 
 ## Status
 
-35 passing `node --test` cases. Depends on `aiwa-core` and
+36 passing `node --test` cases. Depends on `aiwa-core` and
 `aiwa-platform` via their GitHub URLs (none of the three are on npm
 yet).
 

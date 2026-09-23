@@ -503,6 +503,9 @@ export class Channel {
   /** This channel's own real, deterministic session address — distinct from your own root address, one per peer. */
   get address() { return this._keypair.publicKey.toBase58(); }
 
+  /** The same real EventLog the owner's own AIWA instance uses — for passing into aiwa-platform functions that take a log directly (e.g. publishBundle(channel.identity, channel.log, domain, {...})), independent of whether the owner's root identity is currently connected. */
+  get log() { return this._aiwa.log; }
+
   /**
    * What the real owner still has available to send through this or
    * any other channel — delegation never partitions the balance, it

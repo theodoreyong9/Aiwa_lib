@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spendableClaims, EventLog } from 'aiwa-core';
-import { LoopbackTransport } from 'aiwa-platform';
+import { LoopbackTransport, publishBundle, readBundle } from 'aiwa-platform';
 import { AIWA, encodeOfflineBundle, decodeOfflineBundle, fromUnits, toUnits } from '../src/wallet.js';
 
 // The same real test economic parameters aiwa-core's own test suite
@@ -524,4 +524,20 @@ test('a channel can redeem a bearer voucher for the real owner, landing the valu
   assert.equal(spendableClaims(state, ownerId.identityId).length, 1, 'the real owner receives it');
   assert.equal(spendableClaims(state, ownerId.identityId)[0].amount, toUnits(claimable));
   assert.equal(spendableClaims(state, channel.identity.id).length, 0, 'the channel\'s own session identity never actually owns the redeemed value');
+});
+
+test('channel.log gives access to the same real EventLog the owner\'s AIWA instance uses, even after the app\'s own reference to that instance is dropped — needed to publish a contract through a channel', async () => {
+  const owner = new AIWA({ rewardParams });
+  const ownerId = await owner.connect();
+  const channel = await owner.openChannel('someone-else-id', { requireNetwork: false });
+  assert.equal(channel.log, owner.log, 'channel.log must be the real, same EventLog instance, not a copy');
+
+  const domain = `contract:${ownerId.identityId}:my-token`;
+  const { manifestEventId } = await publishBundle(channel.identity, channel.log, domain, {
+    name: 'my-token', version: '1.0.0', files: [{ path: 'index.html', content: '<html></html>' }],
+  });
+
+  const bundle = await readBundle(channel.log, manifestEventId);
+  assert.equal(bundle.name, 'my-token');
+  assert.equal(bundle.files['index.html'], '<html></html>');
 });
