@@ -1,10 +1,18 @@
 {
   "name": "aiwa-lib",
-  "version": "0.0.0",
-  "description": "The public developer-facing facade over @aiwa/core and @aiwa/platform — not yet built. See README.",
+  "version": "0.1.0",
+  "description": "The public, developer-facing facade over aiwa-core and aiwa-platform: a real wallet API (connect, balance, claim, send/receive including fully offline) and a smart-contract/token authoring SDK.",
   "type": "module",
   "license": "MIT",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
   "scripts": {
     "test": "node --test"
+  },
+  "dependencies": {
+    "aiwa-core": "github:theodoreyong9/Aiwa_core",
+    "aiwa-platform": "github:theodoreyong9/Aiwa_platform"
   }
 }
