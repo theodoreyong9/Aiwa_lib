@@ -39,7 +39,7 @@ import {
   issueDelegation, buildSignedDelegatedTransferEvent, buildSignedDelegatedSplitEvent,
   deriveVoucherAddress, buildSignedVoucherRedeemEvent, buildSignedDelegatedVoucherRedeemEvent,
   buildSignedAccrualEvent, buildSignedClaimEvent, buildSignedDelegatedClaimEvent,
-  buildCheckpointEvent, findLatestCheckpoint, checkpointWalletState, progressionParents,
+  buildCheckpointEvent, findLatestCheckpoint, checkpointWalletState, progressionParents, buildSignedProgressionEvent,
 } from 'aiwa-core';
 
 // A real, cryptographically random secret — 32 bytes, hex-encoded.
@@ -348,9 +348,18 @@ export class AIWA {
     // progression event from here on is silently rejected forever (a
     // real bug found and fixed this same session).
     const parents = progressionParents(await this.log.head(), current.lastId);
+    // buildSignedProgressionEvent, not a plain payload: aiwa-core's own
+    // progression.js now requires a real Ed25519 signature proving the
+    // signer controls this.identity.id — see its own README for the
+    // real griefing vector (anyone could otherwise advance a domain's
+    // own qTotal for free, permanently reducing its future reward) this
+    // closes.
+    const signedProgression = await buildSignedProgressionEvent(
+      { domain: this.identity.id, epoch, vdfIterations, vdfOutput },
+      this._keypair.secretKey.slice(0, 32), this._keypair.publicKey.toBytes(),
+    );
     const event = await createEvent(this.identity, {
-      domain: this.logDomain, parents, type: 'progression',
-      payload: { domain: this.identity.id, epoch, vdfIterations, vdfOutput },
+      domain: this.logDomain, parents, type: 'progression', payload: signedProgression,
     });
     await this.log.append(event);
     return { epoch, eventId: event.id };

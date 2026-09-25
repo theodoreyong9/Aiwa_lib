@@ -233,6 +233,18 @@ they surfaced** (each caught the next — none was hypothetical):
 deployment decides its own cadence (matching how `startProgressLoop()`
 is also opt-in, not automatic).
 
+**A fourth, separate real bug, found afterward**: `progression.js`'s
+own checks never verified who actually signed a `'progression'` event —
+`vdfSeed`/`vdfOutput` are public, deterministic values, so anyone could
+compute a domain's own next-epoch proof and advance its progression
+without consent, permanently inflating its `domainAge` and reducing its
+future reward per accrual (verified against the real formula: ~9x lower
+at `qTotal=20000` vs. `qTotal=1`, for the same freshly-reset position —
+see aiwa-core's own README). `advanceProgress()` now signs every
+progression event via aiwa-core's `buildSignedProgressionEvent`, the
+identical `deriveId(signerPubkey) === domain` discipline `recordCommitment()`
+already uses.
+
 ### Channels — "sign once, click as many times as you want"
 
 ```js
