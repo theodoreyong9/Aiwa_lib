@@ -5,9 +5,23 @@
 // someone a leaf event alone (e.g. in a QR code) without its real
 // ancestor chain is simply not appendable on their side.
 
-/** Every real event reachable from `eventIds` (inclusive), in an order EventLog.appendMany() can apply directly (parents before children). */
-export async function collectAncestors(log, eventIds) {
-  const seen = new Set();
+/**
+ * Every real event reachable from `eventIds` (inclusive), in an order
+ * EventLog.appendMany() can apply directly (parents before children).
+ *
+ * `excludeIds`, if given, stops the walk the instant it reaches one of
+ * them — never recursing into their own parents. Passing a domain's
+ * own previous log heads here turns this from "the entire history"
+ * into "exactly what's new since then": ancestors(heads at time T) is
+ * always the complete known event set at time T (every event with no
+ * children is, by definition, a head), so nothing before `excludeIds`
+ * is ever missed by stopping there. This is what lets a caller who
+ * already materialized state up to a known frontier fold only the real
+ * delta on every later call, instead of paying the full replay cost
+ * again each time.
+ */
+export async function collectAncestors(log, eventIds, { excludeIds } = {}) {
+  const seen = new Set(excludeIds ?? []);
   const collected = [];
   async function visit(id) {
     if (seen.has(id)) return;

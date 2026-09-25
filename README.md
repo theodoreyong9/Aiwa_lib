@@ -176,6 +176,63 @@ wall-clock time passes. This is not automatic — a wallet UI has to
 actually run the loop while it's open, the same real role AIWA_chain's
 own `vdf-worker.js` played.
 
+### Scalability: incremental materialization, checkpoints, and three real bugs found closing that loop
+
+Every wallet call (`balance()`, `claimable()`, `send()`...) used to fold
+the entire event log from genesis on every single call — a real
+regression this library reintroduced, growing unboundedly for a
+long-lived domain. `_materializeWallet()` now caches the last
+materialized state and folds only the real events appended since.
+`checkpoint()` appends a real, self-signed snapshot of your own current
+state (aiwa-core's own `checkpoint.js`); `pruneToLastCheckpoint()`
+physically deletes everything it already covers, bounding local storage
+too — see aiwa-core's own README for the explicit, honest trust
+tradeoff pruning makes (a peer who only ever receives your pruned log
+trusts your own signed checkpoint instead of independently re-deriving
+history from genesis).
+
+```js
+await aiwa.checkpoint(); // a real, self-signed snapshot of your current state
+const deleted = await aiwa.pruneToLastCheckpoint(); // physically removes what it covers
+```
+
+**Three real bugs found and fixed while closing this loop, in the order
+they surfaced** (each caught the next — none was hypothetical):
+
+1. A checkpoint's own embedded `progression.domains[domain].lastId`
+   named whichever progression event was last accepted *before* the
+   checkpoint — an event pruning is free to delete once the checkpoint
+   exists. Fixed in aiwa-core's `checkpointWalletState()`, which now
+   repoints it to the checkpoint's own real id.
+2. That fix exposed a second, unrelated, pre-existing bug: aiwa-core's
+   `progression.js` requires the domain's last accepted progression
+   event to be a *direct* parent, but every real event builder here
+   (`advanceProgress()` included) sets parents to the log's current
+   heads alone — the instant anything else (`recordCommitment()`, a
+   checkpoint) becomes the sole head in between, that link silently
+   breaks and every later progression event is permanently rejected.
+   Fixed by routing `advanceProgress()`'s parents through aiwa-core's
+   new `progressionParents(heads, lastId)`.
+3. That fix, in turn, revealed a *third* bug: `progressionParents()`'s
+   extra parent edge can point straight past `_materializeWallet()`'s
+   own heads-only incremental-exclusion boundary, back into
+   already-covered territory — the same real event would get folded
+   twice, and aiwa-core's own causal-chain check would reject it the
+   second time as already-advanced-past. Fixed by tracking the real,
+   growing set of already-covered ids (`_coveredIds`, bounded by
+   activity since the last checkpoint, not all-time history) instead of
+   just the latest heads. `test/wallet.test.mjs`'s own
+   `advanceProgress() keeps chaining correctly across an intervening
+   recordCommitment()` test reproduces the original, end-to-end failure
+   this whole chain started from: `claimable()` silently stops growing
+   forever the moment any other real event happens between two
+   progression ticks.
+
+**Honest limit, unchanged by any of this**: `checkpoint()`/
+`pruneToLastCheckpoint()` are two separate calls, not automatic — a real
+deployment decides its own cadence (matching how `startProgressLoop()`
+is also opt-in, not automatic).
+
 ### Channels — "sign once, click as many times as you want"
 
 ```js
@@ -404,7 +461,7 @@ was silently rejected until this was accounted for.
 
 ## Status
 
-36 passing `node --test` cases. Depends on `aiwa-core` and
+41 passing `node --test` cases. Depends on `aiwa-core` and
 `aiwa-platform` via their GitHub URLs (none of the three are on npm
 yet).
 

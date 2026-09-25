@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spendableClaims, EventLog } from 'aiwa-core';
+import { spendableClaims, EventLog, createMemoryBackend } from 'aiwa-core';
 import { LoopbackTransport, publishBundle, readBundle } from 'aiwa-platform';
 import { AIWA, encodeOfflineBundle, decodeOfflineBundle, fromUnits, toUnits } from '../src/wallet.js';
 
@@ -69,6 +69,39 @@ test('the real accrual -> progression -> claimable -> claim -> balance pipeline'
   await aiwa.claim(claimable);
   const balance = await aiwa.balance();
   assert.equal(balance, claimable);
+});
+
+// THE REAL BUG FOUND AND FIXED THIS SAME SESSION: none of this file's
+// other tests call recordCommitment() a SECOND time between progression
+// ticks — they all call it once, then advanceProgress() in an
+// uninterrupted loop, so log.head() never changes to anything but the
+// last progression event in between. Once something else genuinely
+// intervenes (a real committed position increase, mid-progression —
+// an entirely ordinary sequence), advanceProgress()'s own parents must
+// still correctly declare the domain's last accepted progression event,
+// or aiwa-core's own causal-chain check permanently rejects every
+// progression event from then on and claimable() silently stops
+// growing forever. See aiwa-core's progressionParents().
+test('advanceProgress() keeps chaining correctly across an intervening recordCommitment() — claimable() must keep growing, not silently get stuck', async () => {
+  const aiwa = new AIWA({ rewardParams });
+  await aiwa.connect();
+
+  await aiwa.recordCommitment({ b: 10 });
+  await aiwa.advanceProgress({ vdfIterations: VDF_ITERATIONS });
+
+  // A second, real, intervening event for the same domain — the log's
+  // head is now this accrual event, not the progression event above.
+  await aiwa.recordCommitment({ b: 5 });
+
+  await aiwa.advanceProgress({ vdfIterations: VDF_ITERATIONS });
+  await aiwa.advanceProgress({ vdfIterations: VDF_ITERATIONS });
+
+  const state = await aiwa._materializeWallet();
+  assert.equal(state.accrual.progression.domains[aiwa.identity.id].epoch, 3, 'must really reach epoch 3 — a stuck reducer would silently cap this at 1');
+  assert.equal(state.accrual.progression.rejections.length, 0, 'zero real rejections — a real chain, not a masked one');
+
+  const claimable = await aiwa.claimable();
+  assert.ok(Number(claimable) > 0, `expected real claimable growth, got ${claimable}`);
 });
 
 // Found via a real, live browser run of the AIWA_project wallet UI:
@@ -540,4 +573,79 @@ test('channel.log gives access to the same real EventLog the owner\'s AIWA insta
   const bundle = await readBundle(channel.log, manifestEventId);
   assert.equal(bundle.name, 'my-token');
   assert.equal(bundle.files['index.html'], '<html></html>');
+});
+
+test('_materializeWallet() short-circuits to the exact cached object when the log has not changed since the last call — the real incremental-materialization fix, not just a correctness re-check', async () => {
+  const aiwa = new AIWA({ rewardParams });
+  await aiwa.connect();
+  await aiwa.recordCommitment({ b: 50 });
+  const first = await aiwa._materializeWallet();
+  const second = await aiwa._materializeWallet();
+  assert.equal(second, first, 'no new events were appended between the two calls — the cached state object itself must come back, never a freshly recomputed one');
+
+  await aiwa.recordCommitment({ b: 25 });
+  const third = await aiwa._materializeWallet();
+  assert.notEqual(third, first, 'a real, new event must invalidate the cache');
+  assert.equal(third.accrual.positions[aiwa.identity.id].b, 75);
+});
+
+test('checkpoint() + pruneToLastCheckpoint() shrinks real local storage while balance()/claimable() stay correct', async () => {
+  const aiwa = new AIWA({ rewardParams });
+  await aiwa.connect();
+  await aiwa.recordCommitment({ b: 200 });
+  for (let i = 0; i < 6; i++) await aiwa.advanceProgress({ vdfIterations: VDF_ITERATIONS });
+  const claimableBefore = await aiwa.claimable();
+  assert.ok(Number(claimableBefore) > 0);
+
+  const eventCountBeforePrune = (await aiwa.log.backend.allIds()).length;
+  const { eventId } = await aiwa.checkpoint();
+  assert.ok(eventId);
+
+  const removed = await aiwa.pruneToLastCheckpoint();
+  assert.ok(removed > 0, 'pruning a real, non-trivial history must actually remove something');
+  const eventCountAfterPrune = (await aiwa.log.backend.allIds()).length;
+  assert.ok(eventCountAfterPrune < eventCountBeforePrune, 'real local storage must actually shrink');
+
+  // Correctness after prune: identical to what it was right before pruning (nothing was pruned that hadn't already been folded into the checkpoint).
+  assert.equal(await aiwa.claimable(), claimableBefore);
+
+  for (let i = 0; i < 6; i++) await aiwa.advanceProgress({ vdfIterations: VDF_ITERATIONS });
+  const claimableAfter = await aiwa.claimable();
+  assert.ok(Number(claimableAfter) > Number(claimableBefore), 'progression after a prune must keep accruing normally, continuing from the checkpoint');
+});
+
+test('a brand-new AIWA instance over the SAME already-pruned backend computes the identical, correct state using only the checkpoint plus what remains — the real "fresh peer after receiving your pruned log" scenario', async () => {
+  const backend = createMemoryBackend();
+  const original = new AIWA({ rewardParams, backend });
+  const { identityId, address } = await original.connect();
+  await original.recordCommitment({ b: 300 });
+  for (let i = 0; i < 6; i++) await original.advanceProgress({ vdfIterations: VDF_ITERATIONS });
+  const claimable = await original.claimable();
+  await original.claim(claimable);
+  const balanceBefore = await original.balance();
+
+  await original.checkpoint();
+  const removed = await original.pruneToLastCheckpoint();
+  assert.ok(removed > 0);
+
+  // A genuinely separate AIWA instance — no shared in-memory cache with `original` — reconnecting over the SAME, now-pruned backend, exactly like a page reload or a brand-new device receiving only the pruned log.
+  const reconnected = new AIWA({ rewardParams, backend });
+  await reconnected.connect({ secretKeyBytes: original._keypair.secretKey });
+  assert.equal(reconnected.identity.id, identityId.identityId ?? identityId);
+  assert.equal(reconnected.address, address);
+  assert.equal(await reconnected.balance(), balanceBefore, 'a fresh instance reading a pruned log must recover the identical real balance, via the checkpoint alone for everything before it');
+});
+
+test('a Channel still finds and uses the owner\'s checkpoint after the root identity disconnects', async () => {
+  const aiwa = new AIWA({ rewardParams });
+  await aiwa.connect();
+  await aiwa.recordCommitment({ b: 100 });
+  for (let i = 0; i < 6; i++) await aiwa.advanceProgress({ vdfIterations: VDF_ITERATIONS });
+  await aiwa.checkpoint();
+  await aiwa.pruneToLastCheckpoint();
+
+  const channel = await aiwa.openChannel('someone-else-id', { requireNetwork: false });
+  await aiwa.disconnect();
+
+  await assert.doesNotReject(channel.balance(), 'materializing through a channel must still work after disconnect, even over an already-pruned log');
 });

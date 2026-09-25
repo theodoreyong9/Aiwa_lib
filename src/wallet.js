@@ -30,8 +30,8 @@
 // (see this repo's own README).
 
 import {
-  EventLog, createMemoryBackend, createIndexedDbBackend, createEvent, toReducerEvents,
-  initialWalletState, applyWalletEvent, materializeWallet, spendableClaims, totalBalance,
+  EventLog, createMemoryBackend, createIndexedDbBackend, createEvent,
+  initialWalletState, applyWalletEvent, materializeWalletFromWireEvents, spendableClaims, totalBalance,
   buildSignedTransferEvent, buildSignedSplitEvent, claimableNow, toUnits, fromUnits,
   generateLightweightKeypair, lightweightKeypairFromSecretKey, deriveKeypairFromPassphrase,
   deriveKeypairFromBip39Mnemonic, keypairFromSecretKey, loadSolanaWeb3, toIdentity,
@@ -39,6 +39,7 @@ import {
   issueDelegation, buildSignedDelegatedTransferEvent, buildSignedDelegatedSplitEvent,
   deriveVoucherAddress, buildSignedVoucherRedeemEvent, buildSignedDelegatedVoucherRedeemEvent,
   buildSignedAccrualEvent, buildSignedClaimEvent, buildSignedDelegatedClaimEvent,
+  buildCheckpointEvent, findLatestCheckpoint, checkpointWalletState, progressionParents,
 } from 'aiwa-core';
 
 // A real, cryptographically random secret — 32 bytes, hex-encoded.
@@ -49,6 +50,13 @@ function randomVoucherSecret() {
   const bytes = new Uint8Array(32);
   crypto.getRandomValues(bytes);
   return Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** Order-independent comparison of two real head sets — used to decide whether the materialization cache is still current. */
+function sameHeadSet(a, b) {
+  if (a.length !== b.length) return false;
+  const setA = new Set(a);
+  return b.every((id) => setA.has(id));
 }
 import { Replicator } from 'aiwa-platform';
 import { collectAncestors } from './ancestors.js';
@@ -87,6 +95,25 @@ export class AIWA {
     this._keypair = null;
     this.identity = null;
     this.replicator = null;
+    // Incremental materialization cache — see _materializeWallet()'s
+    // own header for why this exists. this._domainId (unlike
+    // this.identity) deliberately survives disconnect(): a Channel can
+    // still call _materializeWallet() after the root identity clears,
+    // and needs to know whose checkpoint to look for.
+    this._materializedState = null;
+    this._materializedHeads = null;
+    // Everything already folded into _materializedState, by id — NOT
+    // just the last-seen heads. See _materializeWallet()'s own header
+    // for the real bug that using heads alone caused: progressionParents()
+    // can add a real event's own last-progression id as an EXTRA parent
+    // whenever it isn't already the head, and that edge reaches straight
+    // past a heads-only exclusion boundary back into already-covered
+    // territory, since it doesn't run through the excluded head itself.
+    // Bounded by real activity since the last checkpoint, not all-time
+    // history — exactly what periodic checkpoint()/pruneToLastCheckpoint()
+    // calls are for.
+    this._coveredIds = new Set();
+    this._domainId = null;
   }
 
   // --- Wallet unlock (identity), fully offline -----------------------
@@ -100,6 +127,7 @@ export class AIWA {
     else keypair = await generateLightweightKeypair();
     this._keypair = keypair;
     this.identity = await toIdentity(keypair);
+    this._domainId = this.identity.id;
     return { address: this.address, identityId: this.identity.id };
   }
 
@@ -149,10 +177,98 @@ export class AIWA {
 
   // --- Local AIWA ledger (fully offline; identical whether or not joinNetwork() is active) ---
 
+  /**
+   * REAL FIX, a real regression this library reintroduced (see this
+   * repo's own README): every call used to fold the ENTIRE event list
+   * from genesis, every time — balance()/claimable()/send() all paid
+   * that cost on every single call, growing unboundedly for a
+   * long-lived domain. Fixed here by caching the last materialized
+   * state, and folding only the real events appended since, tracked via
+   * the GROWING _coveredIds set (not just the latest heads — a real bug
+   * found via this exact scenario: aiwa-core's own progressionParents()
+   * can add a domain's last progression id as an EXTRA parent whenever
+   * it isn't already the head, and that edge reaches straight past a
+   * heads-only exclusion boundary back into already-covered territory —
+   * collectAncestors would then re-walk and re-fold an already-covered
+   * event, which aiwa-core's own causal-chain check then rejects as
+   * "already advanced past this epoch"). Bounded by real activity since
+   * the last checkpoint, not all-time history.
+   *
+   * On the very first call this session (no cache yet), also checks
+   * for a real, self-authored checkpoint (aiwa-core's own
+   * checkpoint.js) to resume from instead of genesis — the real fix
+   * for unbounded local storage, once pruneToLastCheckpoint() below has
+   * actually been used.
+   *
+   * HONEST LIMIT: this cache is in-memory only, per AIWA instance — it
+   * does not survive a page reload by itself (an app wanting that can
+   * persist {heads, state} itself, e.g. to IndexedDB, and seed a fresh
+   * instance's own _materializedState/_materializedHeads from it).
+   * HONEST LIMIT: two overlapping, un-awaited calls can race — whichever
+   * finishes last wins the cache, which can briefly leave a slightly
+   * stale entry; self-correcting on the next call either way, since
+   * heads are always freshly re-read and compared first.
+   */
   async _materializeWallet() {
     const heads = await this.log.head();
-    const orderedEvents = await collectAncestors(this.log, heads);
-    return materializeWallet(this.rewardParams, toReducerEvents(orderedEvents), null, undefined, {});
+    if (this._materializedHeads && sameHeadSet(this._materializedHeads, heads)) return this._materializedState;
+
+    let base = this._materializedState;
+    if (!base) {
+      const domain = this._domainId ?? this.identity?.id;
+      const checkpoint = domain ? await findLatestCheckpoint(this.log, domain) : null;
+      if (checkpoint) {
+        base = checkpointWalletState(checkpoint);
+        this._coveredIds = new Set(checkpoint.payload.coveredHeads);
+      }
+    }
+
+    // excludeIds is the GROWING set of everything already folded — not
+    // just the latest heads (see the constructor's own comment on
+    // _coveredIds for the real bug that distinction fixes).
+    const newEvents = await collectAncestors(this.log, heads, { excludeIds: this._coveredIds });
+    // materializeWalletFromWireEvents, not materializeWallet: newEvents
+    // are the real, un-adapted wire events, and might include a real
+    // checkpoint appended since the last call (e.g. our own checkpoint()
+    // + pruneToLastCheckpoint(), still within this same session) — only
+    // the wire-event form lets its real signature (event.author) verify
+    // at all, and repoints progression's lastId away from whatever it
+    // just pruned. See aiwa-core's own checkpoint.js for the real bug
+    // this closes.
+    const state = await materializeWalletFromWireEvents(this.rewardParams, newEvents, null, undefined, {}, base);
+    for (const event of newEvents) this._coveredIds.add(event.id);
+    this._materializedState = state;
+    this._materializedHeads = heads;
+    return state;
+  }
+
+  /**
+   * A real, self-signed checkpoint of your own current materialized
+   * state, appended to your own log — the basis pruneToLastCheckpoint()
+   * can safely discard prior local storage against. See aiwa-core's own
+   * checkpoint.js for the real, honest tradeoff this makes: a brand-new
+   * peer who only ever receives your pruned log trusts this
+   * checkpoint's own real signature instead of independently
+   * re-deriving your history from genesis.
+   */
+  async checkpoint() {
+    this._requireConnected();
+    const state = await this._materializeWallet();
+    const heads = await this.log.head();
+    const event = await buildCheckpointEvent(this.identity, {
+      logDomain: this.logDomain, parents: heads, coveredHeads: heads, walletState: state,
+    });
+    await this.log.append(event);
+    return { eventId: event.id, coveredHeads: heads };
+  }
+
+  /** Physically discards local storage for everything your own latest real checkpoint already accounts for. Returns how many real events were removed, or 0 if you have never checkpointed. */
+  async pruneToLastCheckpoint() {
+    const domain = this._domainId ?? this.identity?.id;
+    if (!domain) throw new Error('AIWA: pruneToLastCheckpoint needs to know your own domain — connect() at least once first.');
+    const checkpoint = await findLatestCheckpoint(this.log, domain);
+    if (!checkpoint) return 0;
+    return this.log.pruneBeforeCheckpoint(checkpoint.id);
   }
 
   /** Real AIWA balance: unclaimed-but-claimable, plus already-claimed spendable claims. Decimal string, e.g. "1.5". */
@@ -220,12 +336,20 @@ export class AIWA {
   async advanceProgress({ vdfIterations = 100_000 } = {}) {
     this._requireConnected();
     const state = await this._materializeWallet();
-    const current = state.accrual.progression.domains[this.identity.id] ?? { epoch: 0, vdfOutput: null };
+    const current = state.accrual.progression.domains[this.identity.id] ?? { epoch: 0, vdfOutput: null, lastId: null };
     const epoch = current.epoch + 1;
     const seed = vdfSeed(this.identity.id, current.vdfOutput ?? 'genesis');
     const vdfOutput = await computeVdfChain(seed, vdfIterations);
+    // progressionParents(), not just log.head(): if anything else (a
+    // recordCommitment(), a checkpoint()) was appended for this domain
+    // since the last progression tick, the log's real head is THAT
+    // event, not the last progression event — aiwa-core's own causal
+    // chain check requires the latter as a direct parent too, or every
+    // progression event from here on is silently rejected forever (a
+    // real bug found and fixed this same session).
+    const parents = progressionParents(await this.log.head(), current.lastId);
     const event = await createEvent(this.identity, {
-      domain: this.logDomain, parents: await this.log.head(), type: 'progression',
+      domain: this.logDomain, parents, type: 'progression',
       payload: { domain: this.identity.id, epoch, vdfIterations, vdfOutput },
     });
     await this.log.append(event);
