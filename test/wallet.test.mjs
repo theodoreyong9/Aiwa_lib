@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spendableClaims, EventLog, createMemoryBackend } from 'aiwa-core';
+import { spendableClaims, EventLog, createMemoryBackend, findLatestCheckpoint } from 'aiwa-core';
 import { LoopbackTransport, publishBundle, readBundle } from 'aiwa-platform';
 import { AIWA, encodeOfflineBundle, decodeOfflineBundle, fromUnits, toUnits } from '../src/wallet.js';
 
@@ -731,6 +731,48 @@ test('checkpoint() + pruneToLastCheckpoint() shrinks real local storage while ba
   for (let i = 0; i < 6; i++) await aiwa.advanceProgress({ vdfIterations: VDF_ITERATIONS });
   const claimableAfter = await aiwa.claimable();
   assert.ok(Number(claimableAfter) > Number(claimableBefore), 'progression after a prune must keep accruing normally, continuing from the checkpoint');
+});
+
+test('onMaterializeProgress fires with real progress data while folding a real, non-trivial backlog', async () => {
+  const aiwa = new AIWA({ rewardParams });
+  await aiwa.connect();
+  await aiwa.recordCommitment({ b: 100 });
+  for (let i = 0; i < 25; i++) await aiwa.advanceProgress({ vdfIterations: VDF_ITERATIONS });
+
+  const calls = [];
+  aiwa.onMaterializeProgress = (current, total) => calls.push([current, total]);
+  aiwa._materializedState = null; // force a real, full fold instead of the incremental cache hit
+  aiwa._materializedHeads = null;
+  aiwa._coveredIds = new Set();
+
+  await aiwa._materializeWallet();
+  assert.ok(calls.length > 0, 'a real, non-trivial backlog must report at least one real progress tick');
+  const [lastCurrent, lastTotal] = calls[calls.length - 1];
+  assert.equal(lastCurrent, lastTotal, 'the real, final call must report completion');
+});
+
+test('startAutoCheckpoint() periodically checkpoints and prunes on a real timer, and skips when nothing real changed', async () => {
+  const aiwa = new AIWA({ rewardParams });
+  await aiwa.connect();
+  await aiwa.recordCommitment({ b: 50 });
+  for (let i = 0; i < 6; i++) await aiwa.advanceProgress({ vdfIterations: VDF_ITERATIONS });
+
+  const countBefore = (await aiwa.log.backend.allIds()).length;
+  aiwa.startAutoCheckpoint({ intervalMs: 20 });
+  await new Promise((r) => setTimeout(r, 80));
+  aiwa.stopAutoCheckpoint();
+
+  const countAfterFirstRound = (await aiwa.log.backend.allIds()).length;
+  assert.ok(countAfterFirstRound < countBefore, 'a real, non-trivial backlog must actually get checkpointed and pruned');
+  const foundCheckpoint = await findLatestCheckpoint(aiwa.log, aiwa.identity.id);
+  assert.ok(foundCheckpoint, 'a real checkpoint must now exist');
+
+  // A second round, with genuinely nothing new since — must not create another, pointless checkpoint.
+  aiwa.startAutoCheckpoint({ intervalMs: 20 });
+  await new Promise((r) => setTimeout(r, 80));
+  aiwa.stopAutoCheckpoint();
+  const countAfterIdleRound = (await aiwa.log.backend.allIds()).length;
+  assert.equal(countAfterIdleRound, countAfterFirstRound, 'idle time must never produce an empty, pointless checkpoint');
 });
 
 test('a brand-new AIWA instance over the SAME already-pruned backend computes the identical, correct state using only the checkpoint plus what remains — the real "fresh peer after receiving your pruned log" scenario', async () => {

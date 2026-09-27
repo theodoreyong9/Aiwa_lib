@@ -231,7 +231,36 @@ they surfaced** (each caught the next — none was hypothetical):
 **Honest limit, unchanged by any of this**: `checkpoint()`/
 `pruneToLastCheckpoint()` are two separate calls, not automatic — a real
 deployment decides its own cadence (matching how `startProgressLoop()`
-is also opt-in, not automatic).
+is also opt-in, not automatic). `startAutoCheckpoint({ intervalMs })`
+below is exactly that cadence, if a deployment wants it.
+
+#### Bounding the next cold load: `startAutoCheckpoint()` and `onMaterializeProgress`
+
+A real, previously-open question this closes: without ANY checkpoint
+ever taken, a domain's very next cold load (a page reload, a fresh
+device) still replays its ENTIRE real history from genesis — the exact
+same real cost v2.0's own `state-snapshot.js` existed to bound, silently
+reintroduced the moment nobody calls `checkpoint()` themselves.
+
+```js
+aiwa.startAutoCheckpoint({ intervalMs: 5 * 60_000 }); // real default: every 5 minutes
+aiwa.onMaterializeProgress = (current, total) => updateProgressBar(current, total);
+```
+
+`startAutoCheckpoint()` calls `checkpoint()` + `pruneToLastCheckpoint()`
+on a real timer, exactly like `startProgressLoop()` does for
+`advanceProgress()` — skipped entirely, with zero real event created,
+whenever nothing genuinely changed since the last real checkpoint (same
+log heads), so an idle wallet never accumulates pointless, empty
+checkpoints. `disconnect()` stops it, same as the progress loop.
+
+`onMaterializeProgress`, set once on the `AIWA` instance, is called by
+`_materializeWallet()`'s own real fold whenever there's real,
+non-trivial work to report — most visibly the very first call after a
+cold load with no checkpoint yet (a real, unbounded-time genesis
+replay), but honestly wired for ANY real backlog, not special-cased to
+"first load only". Left unset, materialization stays exactly as silent
+as before — this is purely additive.
 
 **A fourth, separate real bug, found afterward**: `progression.js`'s
 own checks never verified who actually signed a `'progression'` event —
@@ -541,7 +570,7 @@ was silently rejected until this was accounted for.
 
 ## Status
 
-48 passing `node --test` cases. Depends on `aiwa-core` and
+50 passing `node --test` cases. Depends on `aiwa-core` and
 `aiwa-platform` via their GitHub URLs (none of the three are on npm
 yet).
 

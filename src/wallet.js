@@ -132,6 +132,18 @@ export class AIWA {
     // calls are for.
     this._coveredIds = new Set();
     this._domainId = null;
+    // Optional, app-set: (current, total) => void, called while
+    // _materializeWallet() folds a real, potentially large backlog —
+    // e.g. the very first call after a reload with no checkpoint yet,
+    // still a real, unbounded-time replay from genesis. Never set by
+    // this library itself; a wallet UI wanting a "catching up…"
+    // indicator sets `aiwa.onMaterializeProgress = (i, total) => ...`
+    // once, right after connect(). Left null, materialization is
+    // silent, exactly as before.
+    this.onMaterializeProgress = null;
+    // Auto-checkpoint timer — see startAutoCheckpoint() below.
+    this._checkpointTimer = null;
+    this._lastCheckpointHeads = null;
   }
 
   // --- Wallet unlock (identity), fully offline -----------------------
@@ -153,6 +165,7 @@ export class AIWA {
   async disconnect() {
     await this.leaveNetwork();
     this.stopProgressLoop();
+    this.stopAutoCheckpoint();
     this._keypair = null;
     this.identity = null;
   }
@@ -253,7 +266,7 @@ export class AIWA {
     // at all, and repoints progression's lastId away from whatever it
     // just pruned. See aiwa-core's own checkpoint.js for the real bug
     // this closes.
-    const state = await materializeWalletFromWireEvents(this.rewardParams, newEvents, null, undefined, {}, base);
+    const state = await materializeWalletFromWireEvents(this.rewardParams, newEvents, this.onMaterializeProgress, undefined, {}, base);
     for (const event of newEvents) this._coveredIds.add(event.id);
     this._materializedState = state;
     this._materializedHeads = heads;
@@ -395,6 +408,35 @@ export class AIWA {
     if (this._progressTimer) {
       clearInterval(this._progressTimer);
       this._progressTimer = null;
+    }
+  }
+
+  /**
+   * Calls checkpoint() + pruneToLastCheckpoint() on a real timer until
+   * stopAutoCheckpoint() — the practical way a long-lived wallet keeps
+   * its OWN next cold load (a page reload, a restart) fast and bounded,
+   * instead of a real, ever-growing full replay from genesis every
+   * single time. Skips a real checkpoint entirely when nothing genuinely
+   * changed since the last one (same real log heads) — never creates a
+   * pointless, empty checkpoint just because the timer fired. Errors are
+   * surfaced via onError, same as startProgressLoop().
+   */
+  startAutoCheckpoint({ intervalMs = 5 * 60_000, onError } = {}) {
+    this.stopAutoCheckpoint();
+    this._checkpointTimer = setInterval(() => {
+      this.log.head().then((heads) => {
+        if (this._lastCheckpointHeads && sameHeadSet(this._lastCheckpointHeads, heads)) return;
+        return this.checkpoint()
+          .then(() => this.pruneToLastCheckpoint())
+          .then(() => { this._lastCheckpointHeads = heads; });
+      }).catch((err) => onError?.(err));
+    }, intervalMs);
+  }
+
+  stopAutoCheckpoint() {
+    if (this._checkpointTimer) {
+      clearInterval(this._checkpointTimer);
+      this._checkpointTimer = null;
     }
   }
 
