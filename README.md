@@ -295,6 +295,74 @@ caller here — `close()` exists for an application's own bookkeeping
 (e.g. stop showing a channel as "open" in a UI), not because it changes
 what the delegation can do.
 
+#### The real handshake — `openChannel()` above never asked the peer anything
+
+**A real gap, found the same way every other one in this project was:
+checked against what the code actually does, not assumed.**
+`openChannel()` is unilateral — you alone decide, sign, and get an
+immediately-usable `Channel`; the peer never consents to anything, and
+has no way to know a channel naming them even exists until money
+arrives. That's a real, working delegation, but it was never a real
+*channel between two peers* in any meaningful sense.
+
+`requestChannel()`/`acceptChannelRequest()`/`Channel.confirm()` add the
+missing consent step, genuinely transport-agnostic — request and accept
+are small, self-contained, independently verifiable blobs (the same
+`encodeOfflineBundle`/`decodeOfflineBundle` shape `sendOfflineBundle()`
+already uses), so the whole handshake works precisely as well over a
+live network message as over a pasted string standing in for a QR code,
+NFC, or Bluetooth transfer — **both sides can be fully offline for all
+three steps**, exactly like an offline payment already can be.
+
+```js
+// Alice's side — fully offline, no joinNetwork() needed for this at all.
+const { blob: requestBlob, channel } = await alice.requestChannel(bobIdentityId);
+channel.status; // 'pending' — every action (send, claim, issueVoucher, redeemVoucher) throws until confirmed
+
+// ...requestBlob travels to Bob however it actually can (a live message, pasted text, a QR code, Bluetooth)...
+
+// Bob's side — also fully offline: verifies the embedded delegation
+// standalone (aiwa-core's own verifyDelegation — no EventLog, no
+// state), never touches his own log just to accept.
+const acceptBlob = await bob.acceptChannelRequest(requestBlob);
+
+// ...acceptBlob travels back to Alice the same real way...
+
+// Alice's side again.
+await channel.confirm(acceptBlob); // real, independent verification — see its own header for all three checks
+channel.status; // 'confirmed' — now genuinely usable
+await channel.send('0.10');
+```
+
+`Channel.confirm()` checks three real things, each closing a specific
+way this could otherwise be abused: the accept really answers *this*
+request (`requestId`, never some unrelated one); the signature really
+verifies *and* really derives the claimed signer (the same
+forged-pubkey check every other signed payload in this codebase makes);
+and the accepter really is the peer this channel was opened for —
+without that last check, anyone who merely obtained the request blob
+(never secret; a delegation is meant to be handed over) could accept a
+channel meant for someone else, defeating the entire point of asking
+for real consent.
+
+`openChannel()` itself is unchanged and still available — a
+`Channel` from it starts `status: 'confirmed'` (immediately usable, the
+identical behavior it always had), useful for tests, internal tooling,
+or a deployment that genuinely doesn't need the peer's consent. The
+handshake above is what a real wallet UI should use instead for an
+actual channel between two people.
+
+**Explicitly out of scope here, on purpose**: a `Channel` still only
+ever carries payment-shaped actions (`send`/`claim`/`issueVoucher`/
+`redeemVoucher`) — real messages or smart-contract dispatch *through* a
+confirmed channel are a real, separate piece of work, not attempted in
+this pass. Likewise, no "is this transaction validated yet" status is
+surfaced anywhere here — `channel.send()`'s own returned event is
+already durably appended to the log the moment it resolves (see
+`EventLog.append()`); whether that's a sufficient answer to "validated"
+for a given deployment, or whether real sync/confirmation status needs
+its own UI, is left open rather than guessed at.
+
 #### A channel is a real, standalone wallet once open — claim, withdraw, receive, publish too
 
 Beyond `send()`, a `Channel` also has `claim(amount)`, `issueVoucher(amount)`,
@@ -473,7 +541,7 @@ was silently rejected until this was accounted for.
 
 ## Status
 
-41 passing `node --test` cases. Depends on `aiwa-core` and
+48 passing `node --test` cases. Depends on `aiwa-core` and
 `aiwa-platform` via their GitHub URLs (none of the three are on npm
 yet).
 

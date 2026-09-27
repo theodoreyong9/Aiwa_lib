@@ -248,6 +248,125 @@ test('openChannel() derives a DIFFERENT session key for a different peer', async
   assert.notEqual(toBob.address, toCarol.address);
 });
 
+// THE REAL HANDSHAKE — requestChannel()/acceptChannelRequest()/confirm():
+// unlike openChannel() above (a unilateral delegation the peer never
+// consents to), this is a genuine two-sided exchange, and it never
+// needs a live network session on either side — the request/accept
+// blobs are meant to travel over ANY real channel (a live message, a
+// pasted string standing in for a QR code or Bluetooth transfer here).
+
+test('a channel is unusable until the real peer accepts it — every action rejects on a pending channel', async () => {
+  const alice = new AIWA({ rewardParams });
+  await alice.connect();
+  const bob = new AIWA({ rewardParams });
+  const { identityId: bobId } = await bob.connect();
+
+  const { channel } = await alice.requestChannel(bobId);
+  assert.equal(channel.status, 'pending');
+  await assert.rejects(channel.send('1.0'), /not confirmed yet/);
+  await assert.rejects(channel.claim('1.0'), /not confirmed yet/);
+});
+
+test('THE REAL HANDSHAKE: request -> accept -> confirm makes a channel usable, entirely offline, with real, independent verification on both sides', async () => {
+  const alice = new AIWA({ rewardParams });
+  await alice.connect();
+  await alice.recordCommitment({ b: 100 });
+  for (let i = 0; i < 5; i++) await alice.advanceProgress({ vdfIterations: VDF_ITERATIONS });
+  const claimable = await alice.claimable();
+  await alice.claim(claimable);
+
+  const bob = new AIWA({ rewardParams });
+  const { identityId: bobId } = await bob.connect();
+
+  // Step 1: Alice requests, offline — a small, portable blob, no network anywhere.
+  const { blob: requestBlob, channel } = await alice.requestChannel(bobId);
+  assert.equal(channel.status, 'pending');
+
+  // Step 2: Bob verifies and accepts, offline too — never touches his own log.
+  const acceptBlob = await bob.acceptChannelRequest(requestBlob);
+
+  // Step 3: Alice confirms using Bob's real response.
+  await channel.confirm(acceptBlob);
+  assert.equal(channel.status, 'confirmed');
+
+  // Now genuinely usable.
+  await channel.send(claimable);
+  const state = await alice._materializeWallet();
+  assert.equal(spendableClaims(state, bobId).length, 1);
+});
+
+test('SECURITY: acceptChannelRequest rejects a request whose embedded delegation was forged — an attacker signing for real, but claiming to be a victim they do not control', async () => {
+  const attacker = new AIWA({ rewardParams });
+  await attacker.connect();
+  const victim = new AIWA({ rewardParams });
+  const { identityId: victimId } = await victim.connect();
+  const bob = new AIWA({ rewardParams });
+  await bob.connect();
+
+  const { blob: attackerBlob } = await attacker.requestChannel('whoever');
+  const forgedRequest = decodeOfflineBundle(attackerBlob);
+  // The attacker's own real signature stays; only the claimed `from` is
+  // swapped to the victim's real id afterward — the identical forgery
+  // shape aiwa-core's own accrual/claim/progression SECURITY tests use.
+  forgedRequest.delegation = { ...forgedRequest.delegation, from: victimId };
+
+  await assert.rejects(bob.acceptChannelRequest(encodeOfflineBundle(forgedRequest)), /does not really verify/);
+});
+
+test('SECURITY: Channel.confirm rejects an accept meant for a different request', async () => {
+  const alice = new AIWA({ rewardParams });
+  await alice.connect();
+  const bob = new AIWA({ rewardParams });
+  const { identityId: bobId } = await bob.connect();
+
+  const { blob: request1 } = await alice.requestChannel(bobId);
+  const { channel: channel2 } = await alice.requestChannel(bobId); // a second, real, distinct request
+  const accept1 = await bob.acceptChannelRequest(request1);
+
+  await assert.rejects(channel2.confirm(accept1), /different channel request/);
+});
+
+test('SECURITY: Channel.confirm rejects an accept from someone other than the real intended peer', async () => {
+  const alice = new AIWA({ rewardParams });
+  await alice.connect();
+  const bob = new AIWA({ rewardParams });
+  const { identityId: bobId } = await bob.connect();
+  const mallory = new AIWA({ rewardParams });
+  await mallory.connect();
+
+  const { blob: requestBlob, channel } = await alice.requestChannel(bobId);
+  // Mallory intercepts the request (never secret — meant to be handed
+  // over) and tries to accept it herself instead of the real Bob.
+  const malloryAccept = await mallory.acceptChannelRequest(requestBlob);
+
+  await assert.rejects(channel.confirm(malloryAccept), /someone other than the real peer/);
+});
+
+test('SECURITY: Channel.confirm rejects a tampered accept (signature no longer matches)', async () => {
+  const alice = new AIWA({ rewardParams });
+  await alice.connect();
+  const bob = new AIWA({ rewardParams });
+  const { identityId: bobId } = await bob.connect();
+
+  const { blob: requestBlob, channel } = await alice.requestChannel(bobId);
+  const acceptBlob = await bob.acceptChannelRequest(requestBlob);
+  const tampered = decodeOfflineBundle(acceptBlob);
+  tampered.timestamp += 1; // signed field, altered after signing
+  await assert.rejects(channel.confirm(encodeOfflineBundle(tampered)), /signature does not verify/);
+});
+
+test('acceptChannelRequest never touches the accepting side\'s own log — it is a pure, offline, stateless check', async () => {
+  const alice = new AIWA({ rewardParams });
+  await alice.connect();
+  const bob = new AIWA({ rewardParams });
+  const { identityId: bobId } = await bob.connect();
+
+  const headsBefore = await bob.log.head();
+  const { blob: requestBlob } = await alice.requestChannel(bobId);
+  await bob.acceptChannelRequest(requestBlob);
+  assert.deepEqual(await bob.log.head(), headsBefore);
+});
+
 test('a channel sent OFFLINE bundle is independently verifiable by a stranger with zero prior sync', async () => {
   const alice = new AIWA({ rewardParams });
   await alice.connect();

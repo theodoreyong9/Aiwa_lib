@@ -30,13 +30,13 @@
 // (see this repo's own README).
 
 import {
-  EventLog, createMemoryBackend, createIndexedDbBackend, createEvent,
+  EventLog, createMemoryBackend, createIndexedDbBackend, createEvent, deriveId,
   initialWalletState, applyWalletEvent, materializeWalletFromWireEvents, spendableClaims, totalBalance,
   buildSignedTransferEvent, buildSignedSplitEvent, claimableNow, toUnits, fromUnits,
   generateLightweightKeypair, lightweightKeypairFromSecretKey, deriveKeypairFromPassphrase,
   deriveKeypairFromBip39Mnemonic, keypairFromSecretKey, loadSolanaWeb3, toIdentity,
   broadcastBurnTransaction, SOLANA_INCINERATOR_ADDRESS, vdfSeed, computeVdfChain,
-  issueDelegation, buildSignedDelegatedTransferEvent, buildSignedDelegatedSplitEvent,
+  issueDelegation, verifyDelegation, buildSignedDelegatedTransferEvent, buildSignedDelegatedSplitEvent,
   deriveVoucherAddress, buildSignedVoucherRedeemEvent, buildSignedDelegatedVoucherRedeemEvent,
   buildSignedAccrualEvent, buildSignedClaimEvent, buildSignedDelegatedClaimEvent,
   buildCheckpointEvent, findLatestCheckpoint, checkpointWalletState, progressionParents, buildSignedProgressionEvent,
@@ -80,6 +80,24 @@ async function sessionKeypairFor(rootKeypair, peerId) {
   secretKey64.set(seed32, 0);
   secretKey64.set(pub32, 32);
   return lightweightKeypairFromSecretKey(secretKey64);
+}
+
+function fromHex(hex) {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return bytes;
+}
+
+// The real consent step a channel needs — see AIWA.requestChannel()'s
+// own header for why a unilateral delegation alone was never enough.
+// Only `requestId`/`from`/`accepting`/`timestamp` are signed here: the
+// request's own delegation is ALREADY a complete, independently
+// verifiable proof (verifyDelegation) of who's asking and for which
+// session key, so there's nothing to duplicate — this signature exists
+// purely to prove the ACCEPTING side's real, deliberate consent, tied
+// to one specific request by its id.
+function canonicalChannelAcceptMessage({ requestId, from, accepting, timestamp }) {
+  return JSON.stringify({ requestId, from, accepting, timestamp });
 }
 
 export { fromUnits, toUnits, SOLANA_INCINERATOR_ADDRESS };
@@ -517,7 +535,76 @@ export class AIWA {
     const delegation = await issueDelegation(
       this._keypair.secretKey.slice(0, 32), this._keypair.publicKey.toBytes(), sessionKeypair.publicKey.toBytes(),
     );
-    return new Channel({ aiwa: this, peerId, sessionKeypair, sessionIdentity, delegation });
+    // status: 'confirmed' — this real, existing path is a UNILATERAL
+    // delegation, exactly as it always was: you alone decide, the peer
+    // never consents to anything before it's already usable. Real
+    // consent from both sides needs requestChannel()/acceptChannelRequest()
+    // below instead.
+    return new Channel({ aiwa: this, peerId, sessionKeypair, sessionIdentity, delegation, status: 'confirmed' });
+  }
+
+  /**
+   * REAL HANDSHAKE, STEP 1 — the real fix for a real gap in openChannel()
+   * above: that path is unilateral, the peer never consents to anything
+   * before the channel is already usable — not a real "channel between
+   * two peers" in any meaningful sense, just a delegation one side
+   * issues to itself. This builds the identical session key + real
+   * delegation, but returns it as a small, portable, independently
+   * verifiable blob (`verifyDelegation`, aiwa-core) instead of an
+   * immediately-usable Channel — hand it to `peerId` over ANY real
+   * channel: a live network message, pasted text, a QR code, NFC,
+   * Bluetooth. This never picks one itself, exactly like
+   * sendOfflineBundle()'s own offline blob — genuinely works with both
+   * sides fully disconnected from any network.
+   *
+   * The returned Channel is PENDING: every action on it (send, claim,
+   * issueVoucher, redeemVoucher) throws until the peer's own real
+   * acceptChannelRequest() response comes back and is handed to
+   * `channel.confirm()` — see that method's own header for exactly what
+   * "confirmed" verifies.
+   */
+  async requestChannel(peerId) {
+    this._requireConnected();
+    const sessionKeypair = await sessionKeypairFor(this._keypair, peerId);
+    const sessionIdentity = await toIdentity(sessionKeypair);
+    const delegation = await issueDelegation(
+      this._keypair.secretKey.slice(0, 32), this._keypair.publicKey.toBytes(), sessionKeypair.publicKey.toBytes(),
+    );
+    const requestId = crypto.randomUUID();
+    const channel = new Channel({ aiwa: this, peerId, sessionKeypair, sessionIdentity, delegation, status: 'pending', requestId });
+    const request = { type: 'channel-request', requestId, peerId, delegation, timestamp: Date.now() };
+    return { blob: encodeOfflineBundle(request), channel };
+  }
+
+  /**
+   * REAL HANDSHAKE, STEP 2 — the peer's own side: decodes and verifies
+   * a requestChannel() blob (real signature check via
+   * verifyDelegation() alone — no EventLog, no state, so this works
+   * fully offline too), then produces a real, signed acknowledgment
+   * proving THIS identity genuinely, deliberately consents to a channel
+   * with the real requester (`request.delegation.from`). Hand the
+   * returned blob back to them over the identical real channel the
+   * request arrived on — network, QR, NFC, Bluetooth, whatever was
+   * actually available. Never appends anything or touches this
+   * identity's own log: accepting a channel request is not, by itself,
+   * a real economic action.
+   */
+  async acceptChannelRequest(requestBlob) {
+    this._requireConnected();
+    const request = decodeOfflineBundle(requestBlob);
+    if (request?.type !== 'channel-request') throw new Error('acceptChannelRequest: not a real channel-request blob.');
+    if (!(await verifyDelegation(request.delegation))) {
+      throw new Error('acceptChannelRequest: the embedded delegation does not really verify — refusing to accept.');
+    }
+    const timestamp = Date.now();
+    const accepting = request.delegation.from;
+    const message = canonicalChannelAcceptMessage({ requestId: request.requestId, from: this.identity.id, accepting, timestamp });
+    const signature = await this.identity.sign(new TextEncoder().encode(message));
+    const accept = {
+      type: 'channel-accept', requestId: request.requestId, from: this.identity.id, accepting,
+      timestamp, signerPubkey: this.identity.publicKey, signature,
+    };
+    return encodeOfflineBundle(accept);
   }
 
   // --- Fully offline send/receive: QR code, NFC, Bluetooth, anything ---
@@ -625,16 +712,62 @@ export class AIWA {
  * delegation exists, nothing here needs any network at all.
  */
 export class Channel {
-  constructor({ aiwa, peerId, sessionKeypair, sessionIdentity, delegation }) {
+  constructor({ aiwa, peerId, sessionKeypair, sessionIdentity, delegation, status = 'confirmed', requestId = null }) {
     this._aiwa = aiwa;
     this.peerId = peerId;
     this._keypair = sessionKeypair;
     this.identity = sessionIdentity;
     this._delegation = delegation;
+    this.status = status; // 'pending' (from requestChannel(), needs confirm()) or 'confirmed' (usable)
+    this._requestId = requestId;
   }
 
   /** This channel's own real, deterministic session address — distinct from your own root address, one per peer. */
   get address() { return this._keypair.publicKey.toBase58(); }
+
+  _requireConfirmed() {
+    if (this.status !== 'confirmed') {
+      throw new Error('Channel: not confirmed yet — the peer has not accepted this channel request (see AIWA.requestChannel()/acceptChannelRequest(), and this channel\'s own confirm()).');
+    }
+  }
+
+  /**
+   * REAL HANDSHAKE, STEP 3 — verifies `acceptBlob` (from the peer's own
+   * real acceptChannelRequest()) and, only if it genuinely checks out,
+   * marks this channel confirmed: send()/claim()/issueVoucher()/
+   * redeemVoucher() all refuse to run before this. Three real things
+   * are checked, all of them load-bearing:
+   *   - `accept.requestId` really matches THIS channel's own request
+   *     (never some other, unrelated accept);
+   *   - the signature really verifies, AND the signer really derives
+   *     `accept.from` (an ordinary forged-pubkey check, same as every
+   *     other signed payload in this codebase);
+   *   - `accept.from` really is the peer THIS channel was opened
+   *     for — without this, any third party who merely obtained the
+   *     request blob (never secret; a delegation is meant to be handed
+   *     over) could "accept" a channel meant for someone else,
+   *     defeating the entire point of asking for real consent.
+   * Works fully offline: no EventLog, no network, no state beyond this
+   * one object.
+   */
+  async confirm(acceptBlob) {
+    const accept = decodeOfflineBundle(acceptBlob);
+    if (accept?.type !== 'channel-accept') throw new Error('Channel.confirm: not a real channel-accept blob.');
+    if (accept.requestId !== this._requestId) throw new Error('Channel.confirm: this accept is for a different channel request.');
+    if (accept.accepting !== this._delegation.from) throw new Error('Channel.confirm: this accept was not addressed to you.');
+    if (accept.from !== this.peerId) throw new Error('Channel.confirm: accepted by someone other than the real peer this channel was opened for.');
+    const { ed25519 } = await import('@noble/curves/ed25519.js');
+    if ((await deriveId(fromHex(accept.signerPubkey))) !== accept.from) throw new Error('Channel.confirm: the signer does not really derive the claimed identity.');
+    const message = canonicalChannelAcceptMessage({ requestId: accept.requestId, from: accept.from, accepting: accept.accepting, timestamp: accept.timestamp });
+    let sigValid;
+    try {
+      sigValid = ed25519.verify(fromHex(accept.signature), new TextEncoder().encode(message), fromHex(accept.signerPubkey));
+    } catch {
+      sigValid = false;
+    }
+    if (!sigValid) throw new Error('Channel.confirm: the real signature does not verify.');
+    this.status = 'confirmed';
+  }
 
   /** The same real EventLog the owner's own AIWA instance uses — for passing into aiwa-platform functions that take a log directly (e.g. publishBundle(channel.identity, channel.log, domain, {...})), independent of whether the owner's root identity is currently connected. */
   get log() { return this._aiwa.log; }
@@ -708,6 +841,7 @@ export class Channel {
    * address instead of a real identity.
    */
   async _sendTo(to, amount) {
+    this._requireConfirmed();
     const aiwa = this._aiwa;
     const { sourceClaim, events } = await this._ensureSpendableClaim(amount);
     const signedTransfer = await buildSignedDelegatedTransferEvent(
@@ -762,6 +896,7 @@ export class Channel {
    * uses closes that gap here too.
    */
   async redeemVoucher({ secret, claimId, events }) {
+    this._requireConfirmed();
     const aiwa = this._aiwa;
     await aiwa.log.appendMany(events);
     const redeem = await buildSignedDelegatedVoucherRedeemEvent(
@@ -791,6 +926,7 @@ export class Channel {
    * action here; the owner's root key never signs again.
    */
   async claim(amount) {
+    this._requireConfirmed();
     const aiwa = this._aiwa;
     const claimId = crypto.randomUUID();
     const signedClaim = await buildSignedDelegatedClaimEvent(
