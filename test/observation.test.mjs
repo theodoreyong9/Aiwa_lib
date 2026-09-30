@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createEvent, buildSignedProgressionEvent } from 'aiwa-core';
+import { createEvent, buildSignedProgressionEvent, buildSignedAccrualEvent } from 'aiwa-core';
 import { LoopbackTransport } from 'aiwa-platform';
 import { AIWA } from '../src/wallet.js';
 import { collectAncestors } from '../src/ancestors.js';
@@ -89,7 +89,7 @@ test('autoObserve: false leaves the log alone until observe() is called', async 
   assert.equal((await bob.observe()).committed.length, 1);
 });
 
-test('identity cost: only a domain\'s own statement counts, and it is what gives a witness weight in the estimate', async () => {
+test('a witness weighs what it committed (b, signed into its own position) — and nobody else\'s statement counts for it', async () => {
   const { aiwa: alice, id: aliceId } = await wallet();
   const { aiwa: bob, id: bobId } = await wallet();
   const { aiwa: carol } = await wallet();
@@ -97,21 +97,20 @@ test('identity cost: only a domain\'s own statement counts, and it is what gives
   await bob.receiveOfflineBundle(await bundleOf(alice));
   await bob.settled();
 
-  assert.equal((await bob.position(aliceId)).estimate, null, 'no identity cost yet: bob is a witness with no weight, so the vote has nothing — the proofs still stand');
+  assert.equal((await bob.position(aliceId)).estimate, null, 'bob has committed nothing: a witness with no weight, so the vote has nothing — the proofs still stand');
   assert.equal((await bob.position(aliceId)).position, 3);
 
-  // carol writes an 'identity-cost' event naming BOB's domain: not bob's statement, not counted
-  const lie = await createEvent(carol.identity, {
-    domain: bob.logDomain, parents: await bob.log.head(), type: 'identity-cost',
-    payload: { domain: bobId, signature: 'carol-made-this-up', burnedLamports: 5_000_000, slot: null },
-  });
-  await bob.log.append(lie);
-  assert.equal((await bob.position(aliceId)).estimate, null);
+  // carol signs an accrual commitment naming BOB's domain: only bob's own key can commit capital to bob's position
+  const forged = await buildSignedAccrualEvent(
+    { domain: bobId, b: 5 }, carol._keypair.secretKey.slice(0, 32), carol._keypair.publicKey.toBytes(),
+  );
+  await bob.log.append(await createEvent(carol.identity, { domain: bob.logDomain, parents: await bob.log.head(), type: 'accrual', payload: forged }));
+  assert.equal((await bob.position(aliceId)).estimate, null, "carol's statement gives bob no weight");
 
-  await bob._recordIdentityCost('bob-real-burn', 1_000_000);
+  await bob.recordCommitment({ b: 2 });
   const weighted = await bob.position(aliceId);
   assert.equal(weighted.estimate.tick, 3);
-  assert.equal(weighted.estimate.totalWeight, 1_000_000);
+  assert.equal(weighted.estimate.totalWeight, 2_000_000_000, 'b = 2 whole units = 2e9 lamports of weight');
 });
 
 test('over a live network session: commitments are made and pushed to the observed domain', async () => {

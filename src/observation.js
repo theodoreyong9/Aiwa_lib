@@ -1,11 +1,11 @@
 // What the wallet knows about OTHER domains, and what it says about it.
 //
 // aiwa-core has the pure pieces — Mirror (a domain's own signed commitments about what it received from
-// others), identity cost (what a domain burned), and `assessPosition` (proofs + the weighted median). Nothing
-// produced their inputs: no component signed a reception commitment when peers synced, and the wallet never
-// rebuilt Mirror or identity-cost state. This file is that missing half:
+// others) and `assessPosition` (proofs + the weighted median). Nothing produced their inputs: no component
+// signed a reception commitment when peers synced, and the wallet never rebuilt Mirror state. This file is that
+// missing half:
 //
-//   readWorld(log)            the log, read as core's reducers want it: Mirror state and identity-cost state
+//   readWorld(log)            the log, read as core's reducers want it: the events and the Mirror state
 //   observations(world, me)   what `me` could honestly commit to having received, per foreign domain
 //
 // AIWA.observe() signs those as 'reception' events; AIWA.position() hands the world to assessPosition.
@@ -19,33 +19,21 @@
 
 import {
   toReducerEvents, deriveSourceEpochLookup, materializeMirror,
-  initialIdentityCostState, registerIdentityCost,
   replayProgression, signatureAuthentic,
 } from 'aiwa-core';
 import { collectAncestors } from './ancestors.js';
 
 /**
  * The log, read as aiwa-core's reducers want it.
- * `identity-cost` events count only when their author is the domain they name: otherwise anyone could register
- * a burn for someone else's domain. (What they carry is the domain's own statement that it burned: nobody here
- * re-checks it against Solana — the same as aiwa-core's reference app, and a stated limit of this design.)
- * @returns {Promise<{ wire: object[], events: object[], mirror: object, identityCost: object }>}
+ * (The weight of a witness is not read here: it is the committed capital `b` each domain signed into its own
+ * accrual position, which the wallet's own materialization already holds — see AIWA.position().)
+ * @returns {Promise<{ wire: object[], events: object[], mirror: object }>}
  */
 export async function readWorld(log) {
   const wire = await collectAncestors(log, await log.head());
   const events = toReducerEvents(wire);
   const mirror = await materializeMirror(events, deriveSourceEpochLookup(events));
-  let identityCost = initialIdentityCostState();
-  for (const event of wire) {
-    if (event.type !== 'identity-cost') continue;
-    const { domain, signature, burnedLamports, slot } = event.payload ?? {};
-    if (event.author !== domain) continue;
-    const result = registerIdentityCost(identityCost, {
-      domain, tx: { signature, err: null, incineratorBalanceDeltaLamports: burnedLamports, commitment: 'finalized', slot: slot ?? null },
-    });
-    if (result.accepted) identityCost = result.state;
-  }
-  return { wire, events, mirror, identityCost };
+  return { wire, events, mirror };
 }
 
 /**

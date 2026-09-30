@@ -40,7 +40,7 @@ import {
   deriveVoucherAddress, buildSignedVoucherRedeemEvent, buildSignedDelegatedVoucherRedeemEvent,
   buildSignedAccrualEvent, buildSignedClaimEvent, buildSignedDelegatedClaimEvent,
   buildCheckpointEvent, findLatestCheckpoint, checkpointWalletState, progressionParents, buildSignedProgressionEvent,
-  buildReceptionCommitment, assessPosition,
+  buildReceptionCommitment, assessPosition, identityCostFromCommitments,
 } from 'aiwa-core';
 import { readWorld, observations, nextReceptionEpoch } from './observation.js';
 
@@ -212,24 +212,7 @@ export class AIWA {
     const keypair = await this.solanaKeypair();
     const signature = await broadcastBurnTransaction(solanaWeb3, connection, keypair, lamports);
     await this.recordCommitment({ b: lamports / 1e9 });
-    await this._recordIdentityCost(signature, lamports);
     return signature;
-  }
-
-  /**
-   * Appends this domain's own 'identity-cost' event: the statement that it burned `lamports` (Solana
-   * transaction `signature`). It is what the weight of this domain as a witness (aiwa-core's Causal Tick) reads.
-   * HONEST LIMIT: it is this domain's own statement — a reader does not re-check it against Solana, exactly as
-   * in aiwa-core's reference app; only the domain itself verified the burn when it made it.
-   */
-  async _recordIdentityCost(signature, lamports) {
-    this._requireConnected();
-    const event = await createEvent(this.identity, {
-      domain: this.logDomain, parents: await this.log.head(), type: 'identity-cost',
-      payload: { domain: this.identity.id, signature, burnedLamports: lamports, slot: null },
-    });
-    await this.log.append(event);
-    return { eventId: event.id };
   }
 
   // --- What this wallet has seen of other domains (Mirror), and where they stand ---
@@ -288,12 +271,16 @@ export class AIWA {
    * Where `domain` stands, from everything this log holds: aiwa-core's assessPosition — a position that never
    * goes below what observers provably received; a rewind or a fork, only when there is proof; the weighted
    * median as the estimate. `selfReportedEpoch`, if the domain reported one, is judged against it.
-   * Read-only: needs no unlocked key. See aiwa-core's README (“Position”) for exactly what it does and does not cover.
+   * A witness weighs what it committed (yellow paper §13: w_i = b_i): the capital each domain signed into its own
+   * position, which the wallet's materialization already holds (identityCostFromCommitments) — the domain's own
+   * statement, not re-checked against Solana. Read-only: needs no unlocked key. See aiwa-core's README (“Position”)
+   * for exactly what it does and does not cover.
    */
   async position(domain, { selfReportedEpoch = null, tolerance, verifyChain } = {}) {
     const world = await readWorld(this.log);
+    const wallet = await this._materializeWallet();
     return assessPosition({
-      mirrorState: world.mirror, identityCostState: world.identityCost, orderedEvents: world.events,
+      mirrorState: world.mirror, identityCostState: identityCostFromCommitments(wallet.accrual.positions), orderedEvents: world.events,
       targetDomain: domain, selfReportedEpoch, ...(tolerance === undefined ? {} : { tolerance }), ...(verifyChain === undefined ? {} : { verifyChain }),
     });
   }

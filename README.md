@@ -513,10 +513,12 @@ rebuilt Mirror or identity-cost state. This is that half (`src/observation.js`, 
   that never goes below what observers provably received; a rewind or a fork only with proof; the weighted median
   as the estimate; `verification: 'chain' | 'signature'` saying which check it could make; `rejectedEvents`.
   Read-only — needs no unlocked key. See aiwa-core's README (“Position”) for exactly what it does and does not cover.
-- **`burn()`** now also appends the domain's own `'identity-cost'` event, which is what gives a witness weight in
-  the estimate (an observer with none weighs nothing there; the proofs do not need it). **Honest limit:** that event
-  is the domain's own statement that it burned — a reader does not re-check it against Solana, exactly as in
-  aiwa-core's reference app. Events of this type count only when their author is the domain they name.
+- **Who weighs what.** A witness weighs what it committed (yellow paper §13: `w_i = b_i`): the capital `b` each domain
+  signed into its own accrual position — `recordCommitment()`, and `burn()` which calls it — which the wallet's
+  materialization already holds (aiwa-core's `identityCostFromCommitments`). An observer that committed nothing weighs
+  nothing in the estimate (the proofs do not need weight), and nobody can commit capital to someone else's position
+  (the accrual reducer checks the signature). **Honest limit:** `b` is the domain's own signed statement; `position()`
+  does not re-check it against a Solana burn.
 
 Costs and limits, stated: `position()` and `observe()` read the log's ancestors and replay each foreign domain's
 chain, so they are not free on a long log (the progression proofs are re-verified, as the wallet does when it
@@ -525,7 +527,7 @@ Checked with two real wallets exchanging events through an offline bundle and th
 (`test/observation.test.mjs`): a bundle is answered by a signed commitment; `observe()` follows the other domain
 forward with increasing commitments and is idempotent; a forged foreign progression event is never cited and is
 reported as rejected; a live session makes the commitment and delivers it to the observed domain; another domain's
-`identity-cost` event naming yours is ignored. **Not checked:** a real network beyond the loopback; a large log.
+accrual commitment naming yours is ignored. **Not checked:** a real network beyond the loopback; a large log.
 
 ## The smart-contract/token authoring SDK
 
