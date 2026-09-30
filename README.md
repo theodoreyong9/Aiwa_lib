@@ -491,6 +491,42 @@ exactly one winner. Verified directly in this repo's own test suite
 ("two real wallets, each honestly redeeming the identical voucher
 offline, converge to exactly one winner once synced").
 
+### Other domains: Mirror, and `position()`
+
+`aiwa-core` has the pieces — Mirror (a domain's own signed commitments about what it received from others),
+identity cost (what a domain burned) and `assessPosition` (proofs plus the weighted median) — but until now
+nothing produced their inputs: no component signed a reception commitment when peers synced, and the wallet never
+rebuilt Mirror or identity-cost state. This is that half (`src/observation.js`, plus three methods on `AIWA`):
+
+- **`observe()`** signs and appends one `'reception'` event per other domain whose progression this log holds
+  beyond what this wallet already committed to having seen, and pushes it to connected peers (the observed domain
+  only counts it as a witness once it holds it). Idempotent: nothing new, nothing appended. **It runs by itself**
+  after a live sync (`Replicator.onSync`), after `receiveOfflineBundle()` and after `redeemVoucher()`, unless the
+  wallet was built with `autoObserve: false`; `onObserveError` hears what a background run could not do and
+  `await aiwa.settled()` waits for it.
+- **What it cites.** Only a progression event that can be trusted: the highest one the domain's own chain
+  *accepts* (aiwa-core's `replayProgression`: epoch + 1, chained, signed by the domain's key, sequential proof
+  verified) — or, when the log does not hold that domain from epoch 1 and the chain cannot be replayed, the
+  highest one whose signature is genuine. A forged one is never cited: it would make this wallet claim an epoch
+  that does not exist, and every honest commitment after it would "go backwards" and be rejected.
+- **`position(domain, { selfReportedEpoch })`** hands everything this log holds to `assessPosition`: a position
+  that never goes below what observers provably received; a rewind or a fork only with proof; the weighted median
+  as the estimate; `verification: 'chain' | 'signature'` saying which check it could make; `rejectedEvents`.
+  Read-only — needs no unlocked key. See aiwa-core's README (“Position”) for exactly what it does and does not cover.
+- **`burn()`** now also appends the domain's own `'identity-cost'` event, which is what gives a witness weight in
+  the estimate (an observer with none weighs nothing there; the proofs do not need it). **Honest limit:** that event
+  is the domain's own statement that it burned — a reader does not re-check it against Solana, exactly as in
+  aiwa-core's reference app. Events of this type count only when their author is the domain they name.
+
+Costs and limits, stated: `position()` and `observe()` read the log's ancestors and replay each foreign domain's
+chain, so they are not free on a long log (the progression proofs are re-verified, as the wallet does when it
+materializes); a pruned log (checkpoint) cannot be replayed from epoch 1 and falls back to signatures, visibly.
+Checked with two real wallets exchanging events through an offline bundle and through `LoopbackTransport`
+(`test/observation.test.mjs`): a bundle is answered by a signed commitment; `observe()` follows the other domain
+forward with increasing commitments and is idempotent; a forged foreign progression event is never cited and is
+reported as rejected; a live session makes the commitment and delivers it to the observed domain; another domain's
+`identity-cost` event naming yours is ignored. **Not checked:** a real network beyond the loopback; a large log.
+
 ## The smart-contract/token authoring SDK
 
 ```js
@@ -570,7 +606,7 @@ was silently rejected until this was accounted for.
 
 ## Status
 
-50 passing `node --test` cases. Depends on `aiwa-core` and
+57 passing `node --test` cases. Depends on `aiwa-core` and
 `aiwa-platform` via their GitHub URLs (none of the three are on npm
 yet).
 

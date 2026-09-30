@@ -40,7 +40,9 @@ import {
   deriveVoucherAddress, buildSignedVoucherRedeemEvent, buildSignedDelegatedVoucherRedeemEvent,
   buildSignedAccrualEvent, buildSignedClaimEvent, buildSignedDelegatedClaimEvent,
   buildCheckpointEvent, findLatestCheckpoint, checkpointWalletState, progressionParents, buildSignedProgressionEvent,
+  buildReceptionCommitment, assessPosition,
 } from 'aiwa-core';
+import { readWorld, observations, nextReceptionEpoch } from './observation.js';
 
 // A real, cryptographically random secret — 32 bytes, hex-encoded.
 // This is what a voucher's QR code actually carries; whoever can
@@ -103,7 +105,7 @@ function canonicalChannelAcceptMessage({ requestId, from, accepting, timestamp }
 export { fromUnits, toUnits, SOLANA_INCINERATOR_ADDRESS };
 
 export class AIWA {
-  constructor({ rewardParams, logDomain = 'aiwa', dbName, backend } = {}) {
+  constructor({ rewardParams, logDomain = 'aiwa', dbName, backend, autoObserve = true } = {}) {
     if (!rewardParams) {
       throw new Error('AIWA: rewardParams ({alpha, beta, gamma, C, minQ}) is required — this library never invents a deployment\'s own economic parameters.');
     }
@@ -144,6 +146,13 @@ export class AIWA {
     // Auto-checkpoint timer — see startAutoCheckpoint() below.
     this._checkpointTimer = null;
     this._lastCheckpointHeads = null;
+    // Mirror: when events from another domain arrive (a live sync, an offline bundle), sign a reception
+    // commitment for them — see observe(). On by default, because Mirror is meant to be continuous; turn it
+    // off to call observe() yourself. onObserveError, if set, hears what a background observe() could not do.
+    this.autoObserve = autoObserve;
+    this.onObserveError = null;
+    this._observing = null;
+    this._observeAgain = false;
   }
 
   // --- Wallet unlock (identity), fully offline -----------------------
@@ -203,7 +212,90 @@ export class AIWA {
     const keypair = await this.solanaKeypair();
     const signature = await broadcastBurnTransaction(solanaWeb3, connection, keypair, lamports);
     await this.recordCommitment({ b: lamports / 1e9 });
+    await this._recordIdentityCost(signature, lamports);
     return signature;
+  }
+
+  /**
+   * Appends this domain's own 'identity-cost' event: the statement that it burned `lamports` (Solana
+   * transaction `signature`). It is what the weight of this domain as a witness (aiwa-core's Causal Tick) reads.
+   * HONEST LIMIT: it is this domain's own statement — a reader does not re-check it against Solana, exactly as
+   * in aiwa-core's reference app; only the domain itself verified the burn when it made it.
+   */
+  async _recordIdentityCost(signature, lamports) {
+    this._requireConnected();
+    const event = await createEvent(this.identity, {
+      domain: this.logDomain, parents: await this.log.head(), type: 'identity-cost',
+      payload: { domain: this.identity.id, signature, burnedLamports: lamports, slot: null },
+    });
+    await this.log.append(event);
+    return { eventId: event.id };
+  }
+
+  // --- What this wallet has seen of other domains (Mirror), and where they stand ---
+
+  /**
+   * Signs and appends a reception commitment for every other domain whose progression this log holds beyond
+   * what this wallet already committed to having seen — the recurring, signed "I received this of X" that
+   * aiwa-core's Mirror is built on, and what gives the proofs of `position()` their witnesses. Only events that
+   * are trusted are cited (see observation.js). Idempotent: nothing new, nothing appended.
+   * Runs by itself after a sync or an offline bundle unless `autoObserve` was turned off.
+   * @returns {Promise<{ committed: Array<{ sourceDomain: string, eventId: string, epoch: number }> }>}
+   */
+  async observe() {
+    this._requireConnected();
+    const me = this.identity.id;
+    const world = await readWorld(this.log);
+    let sequence = nextReceptionEpoch(world.mirror, me);
+    const committed = [];
+    for (const found of await observations(world, me)) {
+      const payload = await buildReceptionCommitment(this._keypair, me, sequence++, found.sourceDomain, [found.eventId]);
+      const event = await createEvent(this.identity, {
+        domain: this.logDomain, parents: await this.log.head(), type: 'reception', payload,
+      });
+      await this.log.append(event);
+      // The observed domain and everyone else only count this as a witness once they hold it: same push as send().
+      if (this.replicator) await this.replicator.publish(await collectAncestors(this.log, [event.id]));
+      committed.push(found);
+    }
+    return { committed };
+  }
+
+  // One background observe() at a time; a request that arrives meanwhile is folded into one more run.
+  _scheduleObserve() {
+    if (!this.autoObserve || !this.identity) return;
+    if (this._observing) { this._observeAgain = true; return; }
+    this._observing = (async () => {
+      try {
+        do {
+          this._observeAgain = false;
+          if (this.identity) await this.observe();
+        } while (this._observeAgain);
+      } catch (err) {
+        if (this.onObserveError) this.onObserveError(err); else console.error('AIWA: observe() failed:', err);
+      } finally {
+        this._observing = null;
+      }
+    })();
+  }
+
+  /** Resolves once any background observe() has finished (tests, and apps that want to read right after a sync). */
+  async settled() {
+    while (this._observing) await this._observing;
+  }
+
+  /**
+   * Where `domain` stands, from everything this log holds: aiwa-core's assessPosition — a position that never
+   * goes below what observers provably received; a rewind or a fork, only when there is proof; the weighted
+   * median as the estimate. `selfReportedEpoch`, if the domain reported one, is judged against it.
+   * Read-only: needs no unlocked key. See aiwa-core's README (“Position”) for exactly what it does and does not cover.
+   */
+  async position(domain, { selfReportedEpoch = null, tolerance, verifyChain } = {}) {
+    const world = await readWorld(this.log);
+    return assessPosition({
+      mirrorState: world.mirror, identityCostState: world.identityCost, orderedEvents: world.events,
+      targetDomain: domain, selfReportedEpoch, ...(tolerance === undefined ? {} : { tolerance }), ...(verifyChain === undefined ? {} : { verifyChain }),
+    });
   }
 
   // --- Local AIWA ledger (fully offline; identical whether or not joinNetwork() is active) ---
@@ -679,6 +771,7 @@ export class AIWA {
    */
   async receiveOfflineBundle(bundle) {
     await this.log.appendMany(bundle.events);
+    this._scheduleObserve();
   }
 
   /**
@@ -717,6 +810,7 @@ export class AIWA {
   async redeemVoucher({ secret, claimId, events }) {
     this._requireConnected();
     await this.log.appendMany(events);
+    this._scheduleObserve();
     const redeem = await buildSignedVoucherRedeemEvent(
       { claimId, secret, to: this.identity.id },
       this._keypair.secretKey.slice(0, 32), this._keypair.publicKey.toBytes(),
@@ -734,11 +828,15 @@ export class AIWA {
   async joinNetwork(transport) {
     this._requireConnected();
     this.replicator = new Replicator({ transport, log: this.log, domain: this.logDomain });
+    // Events that just arrived from a peer: commit to having received them (see observe()).
+    this._unsubObserve = this.replicator.onSync(({ receivedCount }) => { if (receivedCount > 0) this._scheduleObserve(); });
     await this.replicator.start();
   }
 
   async leaveNetwork() {
     if (this.replicator) {
+      this._unsubObserve?.();
+      this._unsubObserve = null;
       await this.replicator.stop();
       this.replicator = null;
     }
