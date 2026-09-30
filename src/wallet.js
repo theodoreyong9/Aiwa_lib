@@ -40,7 +40,8 @@ import {
   deriveVoucherAddress, buildSignedVoucherRedeemEvent, buildSignedDelegatedVoucherRedeemEvent,
   buildSignedAccrualEvent, buildSignedClaimEvent, buildSignedDelegatedClaimEvent,
   buildCheckpointEvent, findLatestCheckpoint, checkpointWalletState, progressionParents, buildSignedProgressionEvent,
-  buildReceptionCommitment, assessPosition, identityCostFromCommitments,
+  buildReceptionCommitment, assessPosition, identityCostFromCommitments, identityCostFromBurns,
+  fetchBurnRecord, verifyBurnRecordFor, withConfirmedBurns,
 } from 'aiwa-core';
 import { readWorld, observations, nextReceptionEpoch } from './observation.js';
 
@@ -105,7 +106,7 @@ function canonicalChannelAcceptMessage({ requestId, from, accepting, timestamp }
 export { fromUnits, toUnits, SOLANA_INCINERATOR_ADDRESS };
 
 export class AIWA {
-  constructor({ rewardParams, logDomain = 'aiwa', dbName, backend, autoObserve = true } = {}) {
+  constructor({ rewardParams, logDomain = 'aiwa', dbName, backend, autoObserve = true, connection = null } = {}) {
     if (!rewardParams) {
       throw new Error('AIWA: rewardParams ({alpha, beta, gamma, C, minQ}) is required — this library never invents a deployment\'s own economic parameters.');
     }
@@ -151,6 +152,12 @@ export class AIWA {
     // off to call observe() yourself. onObserveError, if set, hears what a background observe() could not do.
     this.autoObserve = autoObserve;
     this.onObserveError = null;
+    // Burns THIS wallet has confirmed against Solana (signature -> the record fetchBurnRecord returned). A
+    // commitment counts only as far as confirmed burns cover it (aiwa-core, genesis commitment), so what is in here
+    // decides what the wallet credits — to itself and to every other domain. `connection`, a Solana Connection, if
+    // given, lets the wallet confirm by itself when events arrive; otherwise call confirmBurns(connection).
+    this._burnRecords = {};
+    this.connection = connection;
     this._observing = null;
     this._observeAgain = false;
   }
@@ -211,8 +218,63 @@ export class AIWA {
     const solanaWeb3 = await loadSolanaWeb3();
     const keypair = await this.solanaKeypair();
     const signature = await broadcastBurnTransaction(solanaWeb3, connection, keypair, lamports);
+    await this.recordBurn(signature, connection);
     await this.recordCommitment({ b: lamports / 1e9 });
     return signature;
+  }
+
+  /**
+   * Asks Solana for the FINALIZED transaction `signature`, checks that it is a burn paid by THIS wallet's own key,
+   * and — only then — publishes it ('burn-record': the signature, nothing else) so that the capital it covers can be
+   * committed. burn() does this for you; call it yourself to finish a burn whose transaction was broadcast but could
+   * not be confirmed at the time (Solana did not report it finalized yet).
+   */
+  async recordBurn(signature, connection = this.connection) {
+    this._requireConnected();
+    if (!connection) throw new Error('AIWA: recordBurn needs a Solana connection.');
+    const record = await fetchBurnRecord(connection, signature);
+    if (!record) throw new Error(`AIWA: Solana does not report ${signature} as a finalized transaction (yet) — call recordBurn(signature, connection) again later.`);
+    const check = await verifyBurnRecordFor(this.identity.id, record);
+    if (!check.valid) throw new Error(`AIWA: ${signature} is not a burn by this wallet: ${check.reason}`);
+    this._noteBurnRecords({ [signature]: record });
+    const event = await createEvent(this.identity, {
+      domain: this.logDomain, parents: await this.log.head(), type: 'burn-record',
+      payload: { domain: this.identity.id, signature },
+    });
+    await this.log.append(event);
+    if (this.replicator) await this.replicator.publish(await collectAncestors(this.log, [event.id]));
+    return { eventId: event.id, lamports: record.incineratorBalanceDeltaLamports };
+  }
+
+  /**
+   * Confirms against Solana the burns that events in this log point at ('burn-record' events, from any domain) and
+   * this wallet has not confirmed yet. What a burn is worth is what Solana says, never what an event says. A burn
+   * Solana does not know (yet) stays pending, and the commitment it would cover stays uncredited until a later call.
+   * @returns {Promise<{ confirmed: string[], pending: string[] }>}
+   */
+  async confirmBurns(connection = this.connection) {
+    if (!connection) throw new Error('AIWA: confirmBurns needs a Solana connection.');
+    const wire = await collectAncestors(this.log, await this.log.head());
+    const wanted = [...new Set(wire.filter((e) => e.type === 'burn-record' && typeof e.payload?.signature === 'string').map((e) => e.payload.signature))];
+    const confirmed = [];
+    const pending = [];
+    const found = {};
+    for (const signature of wanted) {
+      if (this._burnRecords[signature]) continue;
+      let record = null;
+      try { record = await fetchBurnRecord(connection, signature); } catch { /* unreachable: stays pending */ }
+      if (record) { found[signature] = record; confirmed.push(signature); } else pending.push(signature);
+    }
+    if (confirmed.length > 0) this._noteBurnRecords(found);
+    return { confirmed, pending };
+  }
+
+  // A newly confirmed burn changes what earlier commitments were worth: fold the log again from its base.
+  _noteBurnRecords(records) {
+    Object.assign(this._burnRecords, records);
+    this._materializedState = null;
+    this._materializedHeads = null;
+    this._coveredIds = new Set();
   }
 
   // --- What this wallet has seen of other domains (Mirror), and where they stand ---
@@ -252,6 +314,7 @@ export class AIWA {
       try {
         do {
           this._observeAgain = false;
+          if (this.connection) await this.confirmBurns(this.connection);
           if (this.identity) await this.observe();
         } while (this._observeAgain);
       } catch (err) {
@@ -271,16 +334,18 @@ export class AIWA {
    * Where `domain` stands, from everything this log holds: aiwa-core's assessPosition — a position that never
    * goes below what observers provably received; a rewind or a fork, only when there is proof; the weighted
    * median as the estimate. `selfReportedEpoch`, if the domain reported one, is judged against it.
-   * A witness weighs what it committed (yellow paper §13: w_i = b_i): the capital each domain signed into its own
-   * position, which the wallet's materialization already holds (identityCostFromCommitments) — the domain's own
-   * statement, not re-checked against Solana. Read-only: needs no unlocked key. See aiwa-core's README (“Position”)
+   * A witness weighs what it committed (yellow paper §13: w_i = b_i) — the burns THIS wallet confirmed for it
+   * (identityCostFromBurns); for a deployment that opted out of backed commitments, the capital the domain signed
+   * into its own position (identityCostFromCommitments), its own statement. Read-only: needs no unlocked key. See aiwa-core's README (“Position”)
    * for exactly what it does and does not cover.
    */
   async position(domain, { selfReportedEpoch = null, tolerance, verifyChain } = {}) {
     const world = await readWorld(this.log);
     const wallet = await this._materializeWallet();
     return assessPosition({
-      mirrorState: world.mirror, identityCostState: identityCostFromCommitments(wallet.accrual.positions), orderedEvents: world.events,
+      mirrorState: world.mirror,
+      identityCostState: this.rewardParams.commitmentBacking === 'none' ? identityCostFromCommitments(wallet.accrual.positions) : identityCostFromBurns(wallet.accrual.burns),
+      orderedEvents: world.events,
       targetDomain: domain, selfReportedEpoch, ...(tolerance === undefined ? {} : { tolerance }), ...(verifyChain === undefined ? {} : { verifyChain }),
     });
   }
@@ -345,7 +410,7 @@ export class AIWA {
     // at all, and repoints progression's lastId away from whatever it
     // just pruned. See aiwa-core's own checkpoint.js for the real bug
     // this closes.
-    const state = await materializeWalletFromWireEvents(this.rewardParams, newEvents, this.onMaterializeProgress, undefined, {}, base);
+    const state = await materializeWalletFromWireEvents(this.rewardParams, newEvents, this.onMaterializeProgress, undefined, {}, withConfirmedBurns(base ?? initialWalletState(), this._burnRecords));
     for (const event of newEvents) this._coveredIds.add(event.id);
     this._materializedState = state;
     this._materializedHeads = heads;
@@ -422,6 +487,16 @@ export class AIWA {
    */
   async recordCommitment({ b, T = 0 } = {}) {
     this._requireConnected();
+    // Capital is what a confirmed burn covers (aiwa-core, genesis commitment): refuse here, with the reason, rather
+    // than append an event every reader would reject. Deployments that opted out (commitmentBacking: 'none') skip this.
+    if (this.rewardParams.commitmentBacking !== 'none') {
+      const { accrual } = await this._materializeWallet();
+      const committed = (accrual.positions[this.identity.id]?.b ?? 0) + b;
+      const covered = accrual.burns?.covered?.[this.identity.id] ?? 0;
+      if (Math.round(committed * 1e9) > covered) {
+        throw new Error(`AIWA: a commitment of ${committed} is not covered by the burns confirmed for this wallet (${covered / 1e9}). Burn first — burn(lamports, connection) or recordBurn(signature, connection).`);
+      }
+    }
     const signedAccrual = await buildSignedAccrualEvent(
       { domain: this.identity.id, b, T },
       this._keypair.secretKey.slice(0, 32), this._keypair.publicKey.toBytes(),

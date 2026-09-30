@@ -7,7 +7,8 @@ import { AIWA, encodeOfflineBundle, decodeOfflineBundle, fromUnits, toUnits } fr
 // The same real test economic parameters aiwa-core's own test suite
 // uses (see wallet.test.mjs/accrual.test.mjs there) — a real
 // deployment chooses its own; this file never invents one.
-const rewardParams = { alpha: 1.1, beta: 2.2, gamma: 3, C: Math.pow(33, 3), minQ: 1 };
+// commitmentBacking: 'none' — these tests are not about the burn gate (burn-backed.test.mjs is)
+const rewardParams = { alpha: 1.1, beta: 2.2, gamma: 3, C: Math.pow(33, 3), minQ: 1, commitmentBacking: 'none' };
 const VDF_ITERATIONS = 50; // small — a real deployment uses far more; this only needs to be a REAL, valid chain, not a slow one, for these tests
 
 test('connect() derives a real identity and a real, displayable Solana address', async () => {

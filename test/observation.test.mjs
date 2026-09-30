@@ -7,7 +7,8 @@ import { collectAncestors } from '../src/ancestors.js';
 
 // Mirror, integrated: a wallet that receives another domain's events signs a reception commitment for them, and
 // position() reads the result through aiwa-core's assessPosition.
-const rewardParams = { alpha: 1.1, beta: 2.2, gamma: 3, C: Math.pow(33, 3), minQ: 1 };
+// commitmentBacking: 'none' — these tests are not about the burn gate (burn-backed.test.mjs is)
+const rewardParams = { alpha: 1.1, beta: 2.2, gamma: 3, C: Math.pow(33, 3), minQ: 1, commitmentBacking: 'none' };
 const VDF_ITERATIONS = 20;
 
 async function wallet(options = {}) {

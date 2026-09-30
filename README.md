@@ -491,6 +491,36 @@ exactly one winner. Verified directly in this repo's own test suite
 ("two real wallets, each honestly redeeming the identical voucher
 offline, converge to exactly one winner once synced").
 
+### Capital is what a confirmed burn covers (mandatory)
+
+aiwa-core now enforces the genesis commitment (its README: “The genesis commitment is backed by a burn”): a domain's
+committed capital `b` may not exceed what burns **this reader confirmed** for it. Until then a wallet could sign
+`b = 1 000 000 000` with no burn and accrue on it. In this wallet:
+
+- **`burn(lamports, connection)`** broadcasts the burn, then `recordBurn(signature, connection)` asks Solana for the
+  **finalized** transaction, checks it is a burn paid by *this wallet's own key*, publishes a `'burn-record'` event
+  (the signature and nothing else), and only then calls `recordCommitment({ b })`. If Solana does not report the
+  transaction finalized yet, `recordBurn` says so and can simply be called again later with the signature.
+- **`recordCommitment({ b })`** refuses, with the reason, when the total would exceed what confirmed burns cover —
+  instead of appending an event every reader would reject.
+- **`confirmBurns(connection)`** does the same for other domains' `'burn-record'` events in the log: it asks Solana
+  about each signature it has not confirmed and keeps what Solana says (never what an event says). Until a wallet has
+  confirmed a burn, it credits **nobody's** commitment to that burn — that is the paper's one external dependency,
+  not a new one. Give the wallet a `connection` (`new AIWA({ rewardParams, connection })`) and it confirms by itself
+  whenever events arrive; without one, call `confirmBurns` when online. A burn Solana does not know stays pending.
+  A domain quoting someone else's signature earns nothing (the payer must be the domain's own key and must really
+  have spent what was burned).
+- **Opt out, explicitly**: `rewardParams.commitmentBacking: 'none'` (tests, demos, private economies). Leaving it out
+  means mandatory. This repo's own pre-existing tests say so in one line.
+- `position()` weighs a witness by the burns this wallet confirmed for it (`identityCostFromBurns`).
+
+**Not covered:** a burn is confirmed against whichever Solana endpoint the wallet is given — a dishonest endpoint is
+the wallet owner's problem; a wallet that has never been online credits no one's commitment. Checked with a fake
+Solana (`test/burn-backed.test.mjs`): no burn, no commitment; a burn covers up to what it burned and accrual follows;
+another wallet credits the commitment only after confirming the burn itself; an unknown burn stays pending; quoting
+someone else's burn earns nothing; automatic confirmation with a `connection`. **Not checked against a real Solana
+endpoint** — only its `getTransaction` shape, as aiwa-core reads it.
+
 ### Other domains: Mirror, and `position()`
 
 `aiwa-core` has the pieces — Mirror (a domain's own signed commitments about what it received from others),
@@ -608,7 +638,7 @@ was silently rejected until this was accounted for.
 
 ## Status
 
-57 passing `node --test` cases. Depends on `aiwa-core` and
+65 passing `node --test` cases. Depends on `aiwa-core` and
 `aiwa-platform` via their GitHub URLs (none of the three are on npm
 yet).
 
