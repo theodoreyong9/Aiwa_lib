@@ -496,7 +496,7 @@ offline, converge to exactly one winner once synced").
 `aiwa-core` has the pieces — Mirror (a domain's own signed commitments about what it received from others),
 identity cost (what a domain burned) and `assessPosition` (proofs plus the weighted median) — but until now
 nothing produced their inputs: no component signed a reception commitment when peers synced, and the wallet never
-rebuilt Mirror or identity-cost state. This is that half (`src/observation.js`, plus three methods on `AIWA`):
+rebuilt Mirror state. This is that half (`src/observation.js`, plus three methods on `AIWA`):
 
 - **`observe()`** signs and appends one `'reception'` event per other domain whose progression this log holds
   beyond what this wallet already committed to having seen, and pushes it to connected peers (the observed domain
