@@ -34,7 +34,7 @@ import {
   initialWalletState, applyWalletEvent, materializeWalletFromWireEvents, spendableClaims, totalBalance,
   buildSignedTransferEvent, buildSignedSplitEvent, claimableNow, toUnits, fromUnits,
   generateLightweightKeypair, lightweightKeypairFromSecretKey, deriveKeypairFromPassphrase,
-  deriveKeypairFromBip39Mnemonic, keypairFromSecretKey, loadSolanaWeb3, toIdentity,
+  deriveKeypairFromBip39Mnemonic, generateBip39Mnemonic, keypairFromSecretKey, loadSolanaWeb3, toIdentity,
   broadcastBurnTransaction, SOLANA_INCINERATOR_ADDRESS, vdfSeed, computeVdfChain,
   issueDelegation, verifyDelegation, buildSignedDelegatedTransferEvent, buildSignedDelegatedSplitEvent,
   deriveVoucherAddress, buildSignedVoucherRedeemEvent, buildSignedDelegatedVoucherRedeemEvent,
@@ -195,13 +195,23 @@ export class AIWA {
 
   // --- Wallet unlock (identity), fully offline -----------------------
 
-  /** Derives or generates the real keypair this wallet signs with. Fully offline — no network, no @solana/web3.js load. */
+  /**
+   * Derives or generates the real keypair this wallet signs with. Fully offline — no network, no @solana/web3.js load.
+   * With nothing given, a NEW identity is created from a fresh 12-word recovery phrase, readable as `recoveryPhrase`
+   * while connected: write it down, it is the only way to be this identity again (connect({ mnemonic }) gives the same
+   * address — the same one a Solana wallet derives from those words). Connecting with a mnemonic keeps it readable the
+   * same way; with a passphrase or a raw secret key there is no phrase to show (`recoveryPhrase` is null).
+   */
   async connect({ mnemonic, passphrase, secretKeyBytes } = {}) {
     let keypair;
+    let phrase = null;
     if (secretKeyBytes) keypair = await lightweightKeypairFromSecretKey(secretKeyBytes);
-    else if (mnemonic) keypair = await deriveKeypairFromBip39Mnemonic(mnemonic);
     else if (passphrase) keypair = await deriveKeypairFromPassphrase(passphrase);
-    else keypair = await generateLightweightKeypair();
+    else {
+      phrase = (mnemonic ? mnemonic : await generateBip39Mnemonic(12)).trim().replace(/\s+/g, ' ').toLowerCase();
+      keypair = await deriveKeypairFromBip39Mnemonic(phrase);
+    }
+    this._recoveryPhrase = phrase;
     this._keypair = keypair;
     this.identity = await toIdentity(keypair);
     this._domainId = this.identity.id;
@@ -214,8 +224,12 @@ export class AIWA {
     this.stopProgressLoop();
     this.stopAutoCheckpoint();
     this._keypair = null;
+    this._recoveryPhrase = null;
     this.identity = null;
   }
+
+  /** The recovery phrase of this identity while connected (see connect()), or null when it was not made from one. Secret: whoever has it controls the wallet. */
+  get recoveryPhrase() { return this._recoveryPhrase ?? null; }
 
   get connected() { return !!this.identity; }
   get address() { return this._keypair ? this._keypair.publicKey.toBase58() : null; }

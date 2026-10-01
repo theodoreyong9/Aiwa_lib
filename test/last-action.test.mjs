@@ -249,3 +249,35 @@ test('submissionEvidence(): the evidence an app takes, with the events since its
   const later = await bob.submissionEvidence({ afterEpoch: 2, after: got.baseline.head });
   assert.deepEqual(later.events, [], 'nothing since the baseline');
 });
+
+// --- The recovery phrase: a new identity has one to write down, and it logs back in ---
+
+test('a new identity comes with a 12-word recovery phrase, and connecting with it gives the same identity', async () => {
+  const first = new AIWA({ rewardParams: base });
+  await first.connect();
+  const phrase = first.recoveryPhrase;
+  assert.equal(phrase.split(' ').length, 12);
+  const { address, identityId } = { address: first.address, identityId: first.identity.id };
+
+  const again = new AIWA({ rewardParams: base });
+  await again.connect({ mnemonic: phrase });
+  assert.equal(again.address, address, 'same address as a Solana wallet derives from those words');
+  assert.equal(again.identity.id, identityId);
+  assert.equal(again.recoveryPhrase, phrase, 'a phrase typed in stays readable while connected');
+
+  await first.disconnect();
+  assert.equal(first.recoveryPhrase, null, 'gone from memory once disconnected');
+  const other = new AIWA({ rewardParams: base });
+  await other.connect();
+  assert.notEqual(other.recoveryPhrase, phrase);
+});
+
+test('a passphrase or a raw secret key has no recovery phrase to show', async () => {
+  const a = new AIWA({ rewardParams: base });
+  await a.connect({ passphrase: 'correct horse battery staple' });
+  assert.equal(a.recoveryPhrase, null);
+  const b = new AIWA({ rewardParams: base });
+  await b.connect({ secretKeyBytes: (await import('aiwa-core')).generateLightweightKeypair ? (await (await import('aiwa-core')).generateLightweightKeypair()).secretKey : undefined });
+  assert.equal(b.recoveryPhrase, null);
+  await assert.rejects(new AIWA({ rewardParams: base }).connect({ mnemonic: 'not a real phrase at all' }), /BIP39/);
+});

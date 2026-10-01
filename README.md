@@ -79,6 +79,7 @@ const rewardParams = { alpha: 1.1, beta: 2.2, gamma: 3, C: Math.pow(33, 3), minQ
 
 const aiwa = new AIWA({ rewardParams, dbName: 'my-wallet' }); // omit dbName for an in-memory (Node/test) log
 const { address, identityId } = await aiwa.connect(); // or connect({ mnemonic }) / connect({ passphrase }) / connect({ secretKeyBytes })
+aiwa.recoveryPhrase; // 12 words of a NEW identity (or the phrase you connected with) — show it once, to be written down
 
 // Real, on-chain Solana calls — you provide the real Connection; this
 // library never picks an RPC endpoint for you.
@@ -118,6 +119,12 @@ const voucherBlob = encodeOfflineBundle(voucher); // put THIS in the withdrawal 
 // ...whoever scans it, decodes, and redeems it into THEIR OWN identity:
 await someoneElsesAiwa.redeemVoucher(decodeOfflineBundle(voucherBlob));
 ```
+
+**The recovery phrase.** `connect()` with nothing creates a new identity from a fresh 12-word BIP39 phrase, readable as
+`aiwa.recoveryPhrase` while connected (null after `disconnect()`, and for a passphrase or a raw secret key). An app shows it
+once so it is written down; `connect({ mnemonic })` with those words gives the same address — the one a Solana wallet derives
+from them (`m/44'/501'/0'/0'`), so a phrase works in every Aiwa app and in a Solana wallet. Whoever has it controls the
+wallet: the library never stores it.
 
 ### The offline send/receive path — the real killer feature, honestly scoped
 
@@ -670,7 +677,7 @@ was silently rejected until this was accounted for.
 
 ## Status
 
-79 passing `node --test` cases. Depends on `aiwa-core` and
+81 passing `node --test` cases. Depends on `aiwa-core` and
 `aiwa-platform` via their GitHub URLs (none of the three are on npm
 yet).
 
