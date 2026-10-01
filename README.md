@@ -545,6 +545,9 @@ endpoint** — only its `getTransaction` shape, as aiwa-core reads it.
   Pruning to a checkpoint deletes old events from the log, so it first sets these aside in an archive
   (`keepMiningHistory: false` opts out; `miningArchive` takes your own backend). The archive grows by one event per epoch
   (about 1.7 KB with its proof).
+- **`submissionEvidence({ afterEpoch, after })`** — the two above as one object, `{ version, domain, afterEpoch, events,
+  witnesses }`: what an app hands to aiwa-core's `assessSubmission` (the turnkey side: burns confirmed by the reader,
+  baseline continued, witnesses checked).
 - **`witnesses({ max })`** — what this wallet holds of *other* domains: for each, its highest trusted progression event,
   signed by that domain. A registry that keeps it asks that domain, when it next submits, to show a history that contains
   it — so a wallet cannot keep two histories and show only the favourable one once someone else holds the other. Nothing
@@ -667,7 +670,7 @@ was silently rejected until this was accounted for.
 
 ## Status
 
-78 passing `node --test` cases. Depends on `aiwa-core` and
+79 passing `node --test` cases. Depends on `aiwa-core` and
 `aiwa-platform` via their GitHub URLs (none of the three are on npm
 yet).
 

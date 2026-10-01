@@ -224,3 +224,28 @@ test('witnesses(): what this wallet holds of another domain is that domain\'s ow
   assert.equal(witness.payload.epoch, 3);
   assert.deepEqual(await alice.witnesses(), [], 'a wallet holds nothing of other domains here');
 });
+
+test('submissionEvidence(): the evidence an app takes, with the events since its baseline and the witnesses, ready to send', async () => {
+  const params = { ...succinct, commitmentBacking: 'none' };
+  const alice = await wallet(params);
+  const bob = await wallet(params);
+  await alice.recordCommitment({ b: 5 });
+  await alice.advanceProgress({ epochs: 2 });
+  await bob.receiveOfflineBundle({ events: await collectAncestors(alice.log, await alice.log.head()) });
+  await bob.settled();
+  await bob.recordCommitment({ b: 3 });
+  await bob.advanceProgress({ epochs: 2 });
+  const evidence = await bob.submissionEvidence();
+  assert.equal(evidence.domain, bob.identity.id);
+  assert.equal(evidence.afterEpoch, 0);
+  assert.deepEqual(evidence.events.map((e) => e.type), ['accrual', 'progression']);
+  assert.deepEqual(evidence.witnesses.map((e) => e.author), [alice.identity.id], "alice's own event, which bob holds");
+  // what an app does with it (aiwa-core): bob's mining, and alice's event kept as a witness about alice
+  const { assessSubmission, ingestWitnesses } = await import('aiwa-core');
+  const got = await assessSubmission({ rewardParams: params, evidence, domain: bob.identity.id });
+  assert.equal(got.ok, true, got.reason);
+  assert.equal(got.mining.epoch, 2);
+  assert.equal((await ingestWitnesses({ witnesses: evidence.witnesses, ownDomain: bob.identity.id })).accepted.length, 1);
+  const later = await bob.submissionEvidence({ afterEpoch: 2, after: got.baseline.head });
+  assert.deepEqual(later.events, [], 'nothing since the baseline');
+});

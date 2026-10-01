@@ -575,6 +575,26 @@ export class AIWA {
       .filter(Boolean);
   }
 
+  /**
+   * The evidence an app takes (aiwa-core's `assessSubmission`): this domain's mining events since what the app already
+   * holds, and the witnesses — what this wallet holds of other domains. `{ version, domain, afterEpoch, events,
+   * witnesses }`, ready to be sent as is.
+   * @param {object} [options]
+   * @param {number} [options.afterEpoch] the epoch of the app's baseline for this domain (0 if it has none)
+   * @param {string} [options.after] the chain head of that baseline (`baseline.head`): only what follows is returned
+   * @param {number} [options.maxWitnesses]
+   */
+  async submissionEvidence({ afterEpoch = 0, after = null, maxWitnesses = 20 } = {}) {
+    this._requireConnected();
+    return {
+      version: 1,
+      domain: this.identity.id,
+      afterEpoch,
+      events: await this.exportMiningEvents({ afterEpoch, after }),
+      witnesses: await this.witnesses({ max: maxWitnesses }),
+    };
+  }
+
   /** The mining state of this wallet: the capital that mines, T, the epoch of the last action, the age, the claimable now (aiwa-core's miningState). Null before the first burn. */
   async mining() {
     this._requireConnected();
