@@ -706,7 +706,7 @@ test('_materializeWallet() short-circuits to the exact cached object when the lo
   await aiwa.recordCommitment({ b: 25 });
   const third = await aiwa._materializeWallet();
   assert.notEqual(third, first, 'a real, new event must invalidate the cache');
-  assert.equal(third.accrual.positions[aiwa.identity.id].b, 75);
+  assert.equal(third.accrual.positions[aiwa.identity.id].b, 25, 'a burn replaces the position (last-action mining)');
 });
 
 test('checkpoint() + pruneToLastCheckpoint() shrinks real local storage while balance()/claimable() stay correct', async () => {

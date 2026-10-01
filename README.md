@@ -521,6 +521,24 @@ another wallet credits the commitment only after confirming the burn itself; an 
 someone else's burn earns nothing; automatic confirmation with a `connection`. **Not checked against a real Solana
 endpoint** — only its `getTransaction` shape, as aiwa-core reads it.
 
+### "Last action" mining: T at the burn, a burn pays the previous one, progression a validator can check
+
+- **`burn(lamports, connection, { T })`** — `T` (0 to 0.4, default 0) is the patience rate chosen at **this** burn for what
+  follows; it is checked **before** anything is broadcast (a burn is irreversible). The capital that counts is what is
+  left after T of the burn is destroyed without counting: `b = burned × (1 − T)`. `recordCommitment({ b, T })` refuses,
+  with the reason, when `ceil(b / (1 − T))` exceeds what confirmed burns have left (each burn backs commitments once).
+- **A burn replaces the position and pays the previous one first** (aiwa-core): what had accrued becomes a real, spendable
+  claim, so a second burn never forfeits it. `mining()` → `{ capital, T, lastActionEpoch, epoch, sinceLastAction,
+  claimable }`; `ranking()` → `{ score, laps, epoch }` — the two states an app ranks by.
+- **`rewardParams.epochIterations`** fixes the work of an epoch. `advanceProgress({ epochs })` then does `epochs ×
+  epochIterations` squarings and attaches **one** Wesolowski proof (checked in milliseconds); without it, the original
+  hash-chain epoch. The progress loop never runs two ticks at once (a slow device would otherwise chain two events from
+  the same epoch), nor do two checkpoint rounds.
+- **`exportMiningEvents({ afterEpoch })`** — this domain's own burn-record, progression, accrual and claim events: what a
+  validator hands to aiwa-core's `assessMining` to derive the mining state without trusting the wallet. Pruning to a
+  checkpoint deletes old events from the log, so it first sets these aside in an archive (`keepMiningHistory: false` opts
+  out; `miningArchive` takes your own backend). The archive grows by one event per epoch (about 1.7 KB with its proof).
+
 ### Other domains: Mirror, and `position()`
 
 `aiwa-core` has the pieces — Mirror (a domain's own signed commitments about what it received from others),

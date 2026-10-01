@@ -42,6 +42,7 @@ import {
   buildCheckpointEvent, findLatestCheckpoint, checkpointWalletState, progressionParents, buildSignedProgressionEvent,
   buildReceptionCommitment, assessPosition, identityCostFromCommitments, identityCostFromBurns,
   fetchBurnRecord, verifyBurnRecordFor, withConfirmedBurns,
+  computeSuccinctEpochs, commitmentPriceLamports, MAX_PATIENCE_RATE, miningState, rankingFigure,
 } from 'aiwa-core';
 import { readWorld, observations, nextReceptionEpoch } from './observation.js';
 
@@ -105,14 +106,43 @@ function canonicalChannelAcceptMessage({ requestId, from, accepting, timestamp }
 
 export { fromUnits, toUnits, SOLANA_INCINERATOR_ADDRESS };
 
+// Every event still in the log that is reachable from `ids`: unlike collectAncestors() it does not stop at an event
+// that was pruned (a checkpoint's own parents are gone by design).
+async function knownAncestors(log, ids) {
+  const seen = new Set();
+  const out = [];
+  const stack = [...ids];
+  while (stack.length > 0) {
+    const id = stack.pop();
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const event = await log.get(id);
+    if (!event) continue;
+    out.push(event);
+    stack.push(...event.parents);
+  }
+  return out;
+}
+
+const MINING_TYPES = new Set(['burn-record', 'progression', 'accrual', 'claim']);
+function isMiningEvent(event, domain) {
+  return MINING_TYPES.has(event.type) && event.author === domain;
+}
+
 export class AIWA {
-  constructor({ rewardParams, logDomain = 'aiwa', dbName, backend, autoObserve = true, connection = null } = {}) {
+  constructor({ rewardParams, logDomain = 'aiwa', dbName, backend, autoObserve = true, connection = null, miningArchive, keepMiningHistory = true } = {}) {
     if (!rewardParams) {
       throw new Error('AIWA: rewardParams ({alpha, beta, gamma, C, minQ}) is required — this library never invents a deployment\'s own economic parameters.');
     }
     this.rewardParams = rewardParams;
     this.logDomain = logDomain;
     this.log = new EventLog(backend ?? (dbName ? createIndexedDbBackend(dbName) : createMemoryBackend()));
+    // Pruning to a checkpoint deletes old events from the log. A validator that was never given them (a registry
+    // checking this domain's age, say) needs the ones that prove it: this domain's own burn-record, progression,
+    // accrual and claim events. They are set aside, whole, in this archive before pruning — `keepMiningHistory: false`
+    // opts out (the history then stops at the last checkpoint). Raw storage, no log semantics: nothing in it is ever
+    // folded, it only feeds exportMiningEvents().
+    this._miningArchive = keepMiningHistory ? (miningArchive ?? (dbName && !backend ? createIndexedDbBackend(`${dbName}-mining`) : createMemoryBackend())) : null;
     this._keypair = null;
     this.identity = null;
     this.replicator = null;
@@ -214,13 +244,23 @@ export class AIWA {
    * key AIWA accrues to, there is no separate commit step to forget).
    * Returns the real transaction signature.
    */
-  async burn(lamports, connection) {
+  async burn(lamports, connection, { T = 0 } = {}) {
+    // T is checked BEFORE anything is broadcast: a burn is irreversible, a refusal after it is too late.
+    this._checkPatienceRate(T);
     const solanaWeb3 = await loadSolanaWeb3();
     const keypair = await this.solanaKeypair();
     const signature = await broadcastBurnTransaction(solanaWeb3, connection, keypair, lamports);
-    await this.recordBurn(signature, connection);
-    await this.recordCommitment({ b: lamports / 1e9 });
+    const { lamports: burned } = await this.recordBurn(signature, connection);
+    // "Last action" mining: this burn REPLACES the position (the previous one is paid first, by the reducer), and the
+    // capital that counts is what is left of the burn after T of it is destroyed without counting.
+    await this.recordCommitment({ b: Math.floor(burned * (1 - T)) / 1e9, T });
     return signature;
+  }
+
+  _checkPatienceRate(T) {
+    if (!Number.isFinite(T) || T < 0 || T > MAX_PATIENCE_RATE) {
+      throw new Error(`AIWA: T (the patience rate, chosen at the burn) must be between 0 and ${MAX_PATIENCE_RATE}.`);
+    }
   }
 
   /**
@@ -346,7 +386,7 @@ export class AIWA {
       mirrorState: world.mirror,
       identityCostState: this.rewardParams.commitmentBacking === 'none' ? identityCostFromCommitments(wallet.accrual.positions) : identityCostFromBurns(wallet.accrual.burns),
       orderedEvents: world.events,
-      targetDomain: domain, selfReportedEpoch, ...(tolerance === undefined ? {} : { tolerance }), ...(verifyChain === undefined ? {} : { verifyChain }),
+      targetDomain: domain, selfReportedEpoch, epochIterations: this.rewardParams.epochIterations, ...(tolerance === undefined ? {} : { tolerance }), ...(verifyChain === undefined ? {} : { verifyChain }),
     });
   }
 
@@ -443,7 +483,48 @@ export class AIWA {
     if (!domain) throw new Error('AIWA: pruneToLastCheckpoint needs to know your own domain — connect() at least once first.');
     const checkpoint = await findLatestCheckpoint(this.log, domain);
     if (!checkpoint) return 0;
+    if (this._miningArchive) {
+      // what the checkpoint covers is about to go: set this domain's own mining events aside first
+      for (const event of await knownAncestors(this.log, checkpoint.payload.coveredHeads)) {
+        if (isMiningEvent(event, domain)) await this._miningArchive.putEvent(event);
+      }
+    }
     return this.log.pruneBeforeCheckpoint(checkpoint.id);
+  }
+
+  /**
+   * This domain's own burn-record, progression, accrual and claim events — what a validator (an app, a registry)
+   * needs to derive its mining state without trusting it: aiwa-core's assessMining() folds exactly these. Both what
+   * is still in the log and what pruning set aside, each once. Ordered by creation time; a validator orders them
+   * itself anyway. A validator that already derived the state up to some point only needs the events after it.
+   * @param {{ afterEpoch?: number }} [options] leave out the progression events up to this epoch (the validator's own baseline)
+   */
+  async exportMiningEvents({ afterEpoch = 0 } = {}) {
+    this._requireConnected();
+    const byId = new Map();
+    for (const event of await knownAncestors(this.log, await this.log.head())) {
+      if (isMiningEvent(event, this.identity.id)) byId.set(event.id, event);
+    }
+    if (this._miningArchive) {
+      for (const id of await this._miningArchive.allIds()) {
+        const event = await this._miningArchive.getEvent(id);
+        if (event) byId.set(event.id, event);
+      }
+    }
+    return [...byId.values()]
+      .filter((e) => e.type !== 'progression' || e.payload.epoch > afterEpoch)
+      .sort((a, b) => a.createdAt - b.createdAt);
+  }
+
+  /** The mining state of this wallet: the capital that mines, T, the epoch of the last action, the age, the claimable now (aiwa-core's miningState). Null before the first burn. */
+  async mining() {
+    this._requireConnected();
+    return miningState(this.rewardParams, await this._materializeWallet(), this.identity.id);
+  }
+
+  /** The ranking figure of this wallet — { score, laps, epoch } — what an app ranks by (aiwa-core's rankingFigure). Null before the first burn. */
+  async ranking() {
+    return rankingFigure(await this.mining());
   }
 
   /** Real AIWA balance: unclaimed-but-claimable, plus already-claimed spendable claims. Decimal string, e.g. "1.5". */
@@ -487,14 +568,17 @@ export class AIWA {
    */
   async recordCommitment({ b, T = 0 } = {}) {
     this._requireConnected();
+    this._checkPatienceRate(T);
     // Capital is what a confirmed burn covers (aiwa-core, genesis commitment): refuse here, with the reason, rather
-    // than append an event every reader would reject. Deployments that opted out (commitmentBacking: 'none') skip this.
+    // than append an event every reader would reject. A commitment costs ceil(b / (1 - T)) lamports of burn that no
+    // earlier commitment used. Deployments that opted out (commitmentBacking: 'none') skip this.
     if (this.rewardParams.commitmentBacking !== 'none') {
       const { accrual } = await this._materializeWallet();
-      const committed = (accrual.positions[this.identity.id]?.b ?? 0) + b;
+      const price = commitmentPriceLamports(b, T);
       const covered = accrual.burns?.covered?.[this.identity.id] ?? 0;
-      if (Math.round(committed * 1e9) > covered) {
-        throw new Error(`AIWA: a commitment of ${committed} is not covered by the burns confirmed for this wallet (${covered / 1e9}). Burn first — burn(lamports, connection) or recordBurn(signature, connection).`);
+      const consumed = accrual.burns?.consumed?.[this.identity.id] ?? 0;
+      if (consumed + price > covered) {
+        throw new Error(`AIWA: a commitment of ${b} at T=${T} is not covered by the burns confirmed for this wallet: it costs ${price} lamports, ${covered - consumed} are left (${covered} confirmed, ${consumed} already used). Burn first — burn(lamports, connection) or recordBurn(signature, connection).`);
       }
     }
     const signedAccrual = await buildSignedAccrualEvent(
@@ -518,43 +602,51 @@ export class AIWA {
    * below) while the wallet is open, the same real role
    * AIWA_chain's own vdf-worker.js played.
    */
-  async advanceProgress({ vdfIterations = 100_000 } = {}) {
+  async advanceProgress({ vdfIterations = 100_000, epochs = 1 } = {}) {
     this._requireConnected();
     const state = await this._materializeWallet();
     const current = state.accrual.progression.domains[this.identity.id] ?? { epoch: 0, vdfOutput: null, lastId: null };
-    const epoch = current.epoch + 1;
     const seed = vdfSeed(this.identity.id, current.vdfOutput ?? 'genesis');
-    const vdfOutput = await computeVdfChain(seed, vdfIterations);
-    // progressionParents(), not just log.head(): if anything else (a
-    // recordCommitment(), a checkpoint()) was appended for this domain
-    // since the last progression tick, the log's real head is THAT
-    // event, not the last progression event — aiwa-core's own causal
-    // chain check requires the latter as a direct parent too, or every
-    // progression event from here on is silently rejected forever (a
-    // real bug found and fixed this same session).
+    // A deployment that fixes the work of an epoch (rewardParams.epochIterations) gets the succinct kind: `epochs`
+    // epochs in one event, epochs x epochIterations squarings and ONE proof that anyone checks in milliseconds
+    // (aiwa-core's succinct-vdf.js). Otherwise the original: one epoch, a hash chain of `vdfIterations`.
+    const epochIterations = this.rewardParams.epochIterations;
+    const succinct = Number.isInteger(epochIterations) && epochIterations > 0;
+    let epoch, iterations, vdfOutput, vdfProof;
+    if (succinct) {
+      iterations = epochs * epochIterations;
+      epoch = current.epoch + epochs;
+      ({ vdfOutput, vdfProof } = await computeSuccinctEpochs(seed, iterations));
+    } else {
+      iterations = vdfIterations;
+      epoch = current.epoch + 1;
+      vdfOutput = await computeVdfChain(seed, iterations);
+    }
+    // progressionParents(), not just log.head(): if anything else (a recordCommitment(), a checkpoint()) was
+    // appended for this domain since the last progression tick, the log's real head is THAT event, not the last
+    // progression event — aiwa-core's own causal chain check requires the latter as a direct parent too, or every
+    // progression event from here on is silently rejected forever. Read AFTER the work: it can take a while.
     const parents = progressionParents(await this.log.head(), current.lastId);
-    // buildSignedProgressionEvent, not a plain payload: aiwa-core's own
-    // progression.js now requires a real Ed25519 signature proving the
-    // signer controls this.identity.id — see its own README for the
-    // real griefing vector (anyone could otherwise advance a domain's
-    // own qTotal for free, permanently reducing its future reward) this
-    // closes.
     const signedProgression = await buildSignedProgressionEvent(
-      { domain: this.identity.id, epoch, vdfIterations, vdfOutput },
+      { domain: this.identity.id, epoch, vdfIterations: iterations, vdfOutput },
       this._keypair.secretKey.slice(0, 32), this._keypair.publicKey.toBytes(),
     );
     const event = await createEvent(this.identity, {
-      domain: this.logDomain, parents, type: 'progression', payload: signedProgression,
+      domain: this.logDomain, parents, type: 'progression', payload: vdfProof ? { ...signedProgression, vdfProof } : signedProgression,
     });
     await this.log.append(event);
     return { epoch, eventId: event.id };
   }
 
   /** Calls advanceProgress() on a real timer until stopProgressLoop() — the practical way a wallet UI keeps its own claimable() genuinely growing while open. Errors are surfaced via onError rather than left to reject silently in the background. */
-  startProgressLoop({ intervalMs = 30_000, vdfIterations = 100_000, onError } = {}) {
+  startProgressLoop({ intervalMs = 30_000, vdfIterations = 100_000, epochs = 1, onError } = {}) {
     this.stopProgressLoop();
     this._progressTimer = setInterval(() => {
-      this.advanceProgress({ vdfIterations }).catch((err) => onError?.(err));
+      // A slow device may still be at work when the next tick fires: never two at once (they would chain from the
+      // same epoch, and one would be refused).
+      if (this._progressBusy) return;
+      this._progressBusy = true;
+      this.advanceProgress({ vdfIterations, epochs }).catch((err) => onError?.(err)).finally(() => { this._progressBusy = false; });
     }, intervalMs);
   }
 
@@ -578,12 +670,15 @@ export class AIWA {
   startAutoCheckpoint({ intervalMs = 5 * 60_000, onError } = {}) {
     this.stopAutoCheckpoint();
     this._checkpointTimer = setInterval(() => {
+      // One round at a time: a round that has not finished (a long archive, a slow device) must not overlap the next.
+      if (this._checkpointBusy) return;
+      this._checkpointBusy = true;
       this.log.head().then((heads) => {
         if (this._lastCheckpointHeads && sameHeadSet(this._lastCheckpointHeads, heads)) return;
         return this.checkpoint()
           .then(() => this.pruneToLastCheckpoint())
           .then(() => { this._lastCheckpointHeads = heads; });
-      }).catch((err) => onError?.(err));
+      }).catch((err) => onError?.(err)).finally(() => { this._checkpointBusy = false; });
     }, intervalMs);
   }
 
