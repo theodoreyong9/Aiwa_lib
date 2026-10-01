@@ -534,10 +534,21 @@ endpoint** — only its `getTransaction` shape, as aiwa-core reads it.
   epochIterations` squarings and attaches **one** Wesolowski proof (checked in milliseconds); without it, the original
   hash-chain epoch. The progress loop never runs two ticks at once (a slow device would otherwise chain two events from
   the same epoch), nor do two checkpoint rounds.
-- **`exportMiningEvents({ afterEpoch })`** — this domain's own burn-record, progression, accrual and claim events: what a
-  validator hands to aiwa-core's `assessMining` to derive the mining state without trusting the wallet. Pruning to a
-  checkpoint deletes old events from the log, so it first sets these aside in an archive (`keepMiningHistory: false` opts
-  out; `miningArchive` takes your own backend). The archive grows by one event per epoch (about 1.7 KB with its proof).
+- **The mining events are one signed chain** (aiwa-core): each progression, accrual and claim names the one it follows,
+  and the work of an epoch starts from it. The wallet keeps that line: building an event and appending it is one step
+  under a lock, and work that was under way when an action landed is dropped and done again from the new head (a few
+  seconds). `advanceProgress()` then returns `{ eventId: null, discarded: true }` only if the chain would not hold still
+  three times in a row.
+- **`exportMiningEvents({ after, afterEpoch })`** — this domain's own burn-record, progression, accrual and claim events: what a
+  validator hands to aiwa-core's `assessMining` to derive the mining state without trusting the wallet. `after` is the
+  id of the last mining event the validator holds (`assessMining(...).mining.chainHead`): only what follows is returned.
+  Pruning to a checkpoint deletes old events from the log, so it first sets these aside in an archive
+  (`keepMiningHistory: false` opts out; `miningArchive` takes your own backend). The archive grows by one event per epoch
+  (about 1.7 KB with its proof).
+- **`witnesses({ max })`** — what this wallet holds of *other* domains: for each, its highest trusted progression event,
+  signed by that domain. A registry that keeps it asks that domain, when it next submits, to show a history that contains
+  it — so a wallet cannot keep two histories and show only the favourable one once someone else holds the other. Nothing
+  in it is signed by this wallet.
 
 ### Other domains: Mirror, and `position()`
 
@@ -656,7 +667,7 @@ was silently rejected until this was accounted for.
 
 ## Status
 
-65 passing `node --test` cases. Depends on `aiwa-core` and
+78 passing `node --test` cases. Depends on `aiwa-core` and
 `aiwa-platform` via their GitHub URLs (none of the three are on npm
 yet).
 

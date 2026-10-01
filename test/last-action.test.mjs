@@ -143,3 +143,84 @@ test('the progress loop never runs two ticks at once, however slow the device', 
   aiwa.stopProgressLoop();
   assert.equal(overlapped, false);
 });
+
+// --- The mining events are one signed chain (aiwa-core): the wallet keeps it ---
+
+test('a checkpoint between two stretches of work does not break what a validator reads (it used to)', async () => {
+  const aiwa = await wallet({ ...succinct, commitmentBacking: 'none' });
+  await aiwa.recordCommitment({ b: 5 });
+  await aiwa.advanceProgress({ epochs: 2 });
+  await aiwa.checkpoint();
+  await aiwa.pruneToLastCheckpoint();
+  await aiwa.advanceProgress({ epochs: 2 });
+  const events = await aiwa.exportMiningEvents();
+  const result = await assessMining({ rewardParams: { ...succinct, commitmentBacking: 'none' }, events, domain: aiwa.identity.id });
+  assert.deepEqual(result.rejections, []);
+  assert.equal(result.mining.epoch, 4);
+  assert.equal((await aiwa.mining()).epoch, 4);
+});
+
+test('an action made while work is under way is not lost, and the work started before it is done again', async () => {
+  const aiwa = await wallet({ ...succinct, commitmentBacking: 'none' });
+  await aiwa.recordCommitment({ b: 5 });
+  const working = aiwa.advanceProgress({ epochs: 40 });         // starts from the accrual, and takes a while
+  const burning = aiwa.recordCommitment({ b: 7, T: 0.1 });       // lands meanwhile
+  const [progress, burn] = await Promise.all([working, burning]);
+  assert.ok(progress.eventId, 'the work was redone from the new head, not dropped');
+  const events = await aiwa.exportMiningEvents();
+  const work = events.find((e) => e.id === progress.eventId);
+  assert.equal(work.payload.previous, burn.eventId, 'it follows the burn that landed during it, so it started again from there');
+  const result = await assessMining({ rewardParams: { ...succinct, commitmentBacking: 'none' }, events, domain: aiwa.identity.id });
+  assert.deepEqual(result.rejections, [], 'one line: no event was built on a predecessor that had moved');
+  assert.equal(result.mining.capital, 7);
+  assert.equal(result.mining.epoch, 40);
+});
+
+test('exportMiningEvents({ after }) gives only what follows the validator\'s chain head, and it continues from there', async () => {
+  const params = { ...succinct, commitmentBacking: 'none' };
+  const aiwa = await wallet(params);
+  await aiwa.recordCommitment({ b: 5 });
+  await aiwa.advanceProgress({ epochs: 2 });
+  const first = await assessMining({ rewardParams: params, events: await aiwa.exportMiningEvents(), domain: aiwa.identity.id });
+  const head = first.mining.chainHead;
+  assert.equal(head, (await aiwa.mining()).chainHead);
+
+  await aiwa.recordCommitment({ b: 3 });
+  await aiwa.advanceProgress({ epochs: 2 });
+  const tail = await aiwa.exportMiningEvents({ after: head });
+  assert.deepEqual(tail.map((e) => e.type), ['accrual', 'progression']);
+  const next = await assessMining({ rewardParams: params, events: tail, domain: aiwa.identity.id, baseline: first.state });
+  assert.deepEqual(next.rejections, []);
+  assert.equal(next.mining.epoch, 4);
+  assert.equal(next.mining.capital, 3);
+});
+
+test('a history shown without one of its actions stops at that action: the work after it is bound to it', async () => {
+  const params = { ...succinct, commitmentBacking: 'none' };
+  const aiwa = await wallet(params);
+  await aiwa.recordCommitment({ b: 5 });
+  await aiwa.advanceProgress({ epochs: 2 });
+  const hidden = await aiwa.recordCommitment({ b: 1, T: 0.4 });
+  await aiwa.advanceProgress({ epochs: 3 });
+  const shown = (await aiwa.exportMiningEvents()).filter((e) => e.id !== hidden.eventId);
+  const result = await assessMining({ rewardParams: params, events: shown, domain: aiwa.identity.id });
+  assert.equal(result.mining.epoch, 2);
+  assert.equal(result.mining.capital, 5);
+});
+
+test('witnesses(): what this wallet holds of another domain is that domain\'s own signed progression, ready for a registry', async () => {
+  const params = { ...succinct, commitmentBacking: 'none' };
+  const alice = await wallet(params);
+  const bob = await wallet(params);
+  await alice.recordCommitment({ b: 5 });
+  await alice.advanceProgress({ epochs: 2 });
+  await alice.advanceProgress({ epochs: 1 });
+  await bob.receiveOfflineBundle({ events: await collectAncestors(alice.log, await alice.log.head()) });
+  await bob.settled();
+  const [witness, ...rest] = await bob.witnesses();
+  assert.equal(rest.length, 0);
+  assert.equal(witness.author, alice.identity.id, 'signed by the domain it is about, not by the witness');
+  assert.equal(witness.type, 'progression');
+  assert.equal(witness.payload.epoch, 3);
+  assert.deepEqual(await alice.witnesses(), [], 'a wallet holds nothing of other domains here');
+});

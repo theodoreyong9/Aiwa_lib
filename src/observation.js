@@ -37,20 +37,20 @@ export async function readWorld(log) {
 }
 
 /**
- * For each foreign domain, the highest trusted progression event this log holds, when it is higher than what
- * `me` already committed to having seen.
+ * For each foreign domain, the highest trusted progression event this log holds (whatever `me` committed to).
+ * `options.epochIterations`: the deployment's fixed work of an epoch, if it has one — without it the work-bound events
+ * of such a deployment cannot be replayed, and only the signature is trusted.
  * @returns {Promise<Array<{ sourceDomain: string, eventId: string, epoch: number }>>}
  */
-export async function observations(world, me) {
+export async function heldProgressions(world, me, options = {}) {
   const foreign = new Set();
   for (const event of world.events) {
     const p = event.payload;
     if (p?.type === 'progression' && typeof p.domain === 'string' && p.domain !== me) foreign.add(p.domain);
   }
-  const already = world.mirror.maxSeenEpoch[me] ?? {};
   const found = [];
   for (const domain of foreign) {
-    const replay = await replayProgression(world.events, domain);
+    const replay = await replayProgression(world.events, domain, undefined, options);
     let best = null;
     for (const event of world.events) {
       const p = event.payload;
@@ -58,9 +58,19 @@ export async function observations(world, me) {
       const trusted = replay.genesis ? replay.accepted.has(event.id) : await signatureAuthentic(event);
       if (trusted && (best === null || p.epoch > best.epoch)) best = { sourceDomain: domain, eventId: event.id, epoch: p.epoch };
     }
-    if (best !== null && best.epoch > (already[domain] ?? 0)) found.push(best);
+    if (best !== null) found.push(best);
   }
   return found;
+}
+
+/**
+ * For each foreign domain, the highest trusted progression event this log holds, when it is higher than what
+ * `me` already committed to having seen.
+ * @returns {Promise<Array<{ sourceDomain: string, eventId: string, epoch: number }>>}
+ */
+export async function observations(world, me, options = {}) {
+  const already = world.mirror.maxSeenEpoch[me] ?? {};
+  return (await heldProgressions(world, me, options)).filter((best) => best.epoch > (already[best.sourceDomain] ?? 0));
 }
 
 /** This domain's next reception-commitment sequence number (its own counter, never the observed domain's epoch). */

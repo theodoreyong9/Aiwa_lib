@@ -43,8 +43,9 @@ import {
   buildReceptionCommitment, assessPosition, identityCostFromCommitments, identityCostFromBurns,
   fetchBurnRecord, verifyBurnRecordFor, withConfirmedBurns,
   computeSuccinctEpochs, commitmentPriceLamports, MAX_PATIENCE_RATE, miningState, rankingFigure,
+  miningChainHead, progressionSeed,
 } from 'aiwa-core';
-import { readWorld, observations, nextReceptionEpoch } from './observation.js';
+import { readWorld, observations, heldProgressions, nextReceptionEpoch } from './observation.js';
 
 // A real, cryptographically random secret — 32 bytes, hex-encoded.
 // This is what a voucher's QR code actually carries; whoever can
@@ -220,6 +221,29 @@ export class AIWA {
   get address() { return this._keypair ? this._keypair.publicKey.toBase58() : null; }
   _requireConnected() { if (!this.identity) throw new Error('AIWA: not connected — call connect() first.'); }
 
+  // --- The mining chain ---
+  // A deployment that fixes the work of an epoch (rewardParams.epochIterations) makes a domain's mining events —
+  // progression, accrual, claim — one signed chain: each names the one it follows (`previous`), and the work of an
+  // epoch starts from it (aiwa-core, README). So an action and a stretch of work must not be built from the same
+  // predecessor: one at a time reads the chain's head and appends, under this lock.
+  get _chained() {
+    const ei = this.rewardParams.epochIterations;
+    return Number.isInteger(ei) && ei > 0;
+  }
+
+  _withMiningLock(fn) {
+    const next = (this._miningLock ?? Promise.resolve()).then(() => fn());
+    this._miningLock = next.then(() => {}, () => {});
+    return next;
+  }
+
+  /** What the next mining event must name as `previous`: the id of this domain's last one, null before the first — or undefined when the deployment does not chain them. */
+  async _miningPrevious() {
+    if (!this._chained) return undefined;
+    const { accrual } = await this._materializeWallet();
+    return miningChainHead(accrual, this.identity.id);
+  }
+
   // --- Real Solana chain operations (need a real Connection) ---------
 
   /** The real solanaWeb3.Keypair, for a real on-chain call — lazily loads @solana/web3.js only when actually needed. */
@@ -333,7 +357,7 @@ export class AIWA {
     const world = await readWorld(this.log);
     let sequence = nextReceptionEpoch(world.mirror, me);
     const committed = [];
-    for (const found of await observations(world, me)) {
+    for (const found of await observations(world, me, { epochIterations: this.rewardParams.epochIterations })) {
       const payload = await buildReceptionCommitment(this._keypair, me, sequence++, found.sourceDomain, [found.eventId]);
       const event = await createEvent(this.identity, {
         domain: this.logDomain, parents: await this.log.head(), type: 'reception', payload,
@@ -497,9 +521,13 @@ export class AIWA {
    * needs to derive its mining state without trusting it: aiwa-core's assessMining() folds exactly these. Both what
    * is still in the log and what pruning set aside, each once. Ordered by creation time; a validator orders them
    * itself anyway. A validator that already derived the state up to some point only needs the events after it.
-   * @param {{ afterEpoch?: number }} [options] leave out the progression events up to this epoch (the validator's own baseline)
+   * @param {object} [options]
+   * @param {string} [options.after] the id of the last mining event the validator holds (its baseline's `chainHead`):
+   *   only the events after it are returned — the chain of progression, accrual and claim events from there, and the
+   *   burn records (a validator ignores the ones it already counted)
+   * @param {number} [options.afterEpoch] leave out the progression events up to this epoch (when `after` is not known)
    */
-  async exportMiningEvents({ afterEpoch = 0 } = {}) {
+  async exportMiningEvents({ afterEpoch = 0, after = null } = {}) {
     this._requireConnected();
     const byId = new Map();
     for (const event of await knownAncestors(this.log, await this.log.head())) {
@@ -511,9 +539,40 @@ export class AIWA {
         if (event) byId.set(event.id, event);
       }
     }
-    return [...byId.values()]
-      .filter((e) => e.type !== 'progression' || e.payload.epoch > afterEpoch)
-      .sort((a, b) => a.createdAt - b.createdAt);
+    let events = [...byId.values()];
+    if (after) {
+      // walk the chain back from its head to `after`: what the validator does not hold yet
+      const tail = new Set();
+      let id = this._chained ? await this._miningPrevious() : null;
+      while (id && id !== after && byId.has(id) && !tail.has(id)) {
+        tail.add(id);
+        id = byId.get(id).payload.previous ?? null;
+      }
+      events = events.filter((e) => e.type === 'burn-record' || tail.has(e.id));
+    } else {
+      events = events.filter((e) => e.type !== 'progression' || e.payload.epoch > afterEpoch);
+    }
+    return events.sort((a, b) => a.createdAt - b.createdAt);
+  }
+
+  /**
+   * What this wallet holds of OTHER domains' mining, as evidence for a registry: for each foreign domain whose
+   * progression this log holds, the highest trusted progression event — signed by that domain, which is what makes it
+   * a proof. A registry that keeps it asks that domain, the next time it submits, to show a history that contains it:
+   * a wallet cannot keep two histories and show only the favourable one once someone else holds the other. Nothing
+   * here is signed by this wallet and nothing needs trusting it: the events are the other domain's.
+   * @param {{ max?: number }} [options] at most this many domains (the ones furthest along first)
+   */
+  async witnesses({ max = 20 } = {}) {
+    this._requireConnected();
+    const world = await readWorld(this.log);
+    const held = await heldProgressions(world, this.identity.id, { epochIterations: this.rewardParams.epochIterations });
+    const byId = new Map(world.wire.map((e) => [e.id, e]));
+    return held
+      .sort((a, b) => b.epoch - a.epoch)
+      .slice(0, max)
+      .map((h) => byId.get(h.eventId))
+      .filter(Boolean);
   }
 
   /** The mining state of this wallet: the capital that mines, T, the epoch of the last action, the age, the claimable now (aiwa-core's miningState). Null before the first burn. */
@@ -569,6 +628,10 @@ export class AIWA {
   async recordCommitment({ b, T = 0 } = {}) {
     this._requireConnected();
     this._checkPatienceRate(T);
+    return this._withMiningLock(() => this._recordCommitment({ b, T }));
+  }
+
+  async _recordCommitment({ b, T }) {
     // Capital is what a confirmed burn covers (aiwa-core, genesis commitment): refuse here, with the reason, rather
     // than append an event every reader would reject. A commitment costs ceil(b / (1 - T)) lamports of burn that no
     // earlier commitment used. Deployments that opted out (commitmentBacking: 'none') skip this.
@@ -582,7 +645,7 @@ export class AIWA {
       }
     }
     const signedAccrual = await buildSignedAccrualEvent(
-      { domain: this.identity.id, b, T },
+      { domain: this.identity.id, b, T, previous: await this._miningPrevious() },
       this._keypair.secretKey.slice(0, 32), this._keypair.publicKey.toBytes(),
     );
     const event = await createEvent(this.identity, {
@@ -604,38 +667,60 @@ export class AIWA {
    */
   async advanceProgress({ vdfIterations = 100_000, epochs = 1 } = {}) {
     this._requireConnected();
+    // A deployment that fixes the work of an epoch (rewardParams.epochIterations) gets the succinct kind, chained to
+    // the domain's last mining event: `epochs` epochs in one event, epochs x epochIterations squarings starting from
+    // that event, and ONE proof that anyone checks in milliseconds (aiwa-core's succinct-vdf.js).
+    if (this._chained) return this._advanceChained({ epochs });
+    // Otherwise the original: one epoch, a hash chain of `vdfIterations`.
     const state = await this._materializeWallet();
     const current = state.accrual.progression.domains[this.identity.id] ?? { epoch: 0, vdfOutput: null, lastId: null };
     const seed = vdfSeed(this.identity.id, current.vdfOutput ?? 'genesis');
-    // A deployment that fixes the work of an epoch (rewardParams.epochIterations) gets the succinct kind: `epochs`
-    // epochs in one event, epochs x epochIterations squarings and ONE proof that anyone checks in milliseconds
-    // (aiwa-core's succinct-vdf.js). Otherwise the original: one epoch, a hash chain of `vdfIterations`.
-    const epochIterations = this.rewardParams.epochIterations;
-    const succinct = Number.isInteger(epochIterations) && epochIterations > 0;
-    let epoch, iterations, vdfOutput, vdfProof;
-    if (succinct) {
-      iterations = epochs * epochIterations;
-      epoch = current.epoch + epochs;
-      ({ vdfOutput, vdfProof } = await computeSuccinctEpochs(seed, iterations));
-    } else {
-      iterations = vdfIterations;
-      epoch = current.epoch + 1;
-      vdfOutput = await computeVdfChain(seed, iterations);
-    }
+    const epoch = current.epoch + 1;
+    const vdfOutput = await computeVdfChain(seed, vdfIterations);
     // progressionParents(), not just log.head(): if anything else (a recordCommitment(), a checkpoint()) was
     // appended for this domain since the last progression tick, the log's real head is THAT event, not the last
     // progression event — aiwa-core's own causal chain check requires the latter as a direct parent too, or every
     // progression event from here on is silently rejected forever. Read AFTER the work: it can take a while.
     const parents = progressionParents(await this.log.head(), current.lastId);
     const signedProgression = await buildSignedProgressionEvent(
-      { domain: this.identity.id, epoch, vdfIterations: iterations, vdfOutput },
+      { domain: this.identity.id, epoch, vdfIterations, vdfOutput },
       this._keypair.secretKey.slice(0, 32), this._keypair.publicKey.toBytes(),
     );
     const event = await createEvent(this.identity, {
-      domain: this.logDomain, parents, type: 'progression', payload: vdfProof ? { ...signedProgression, vdfProof } : signedProgression,
+      domain: this.logDomain, parents, type: 'progression', payload: signedProgression,
     });
     await this.log.append(event);
     return { epoch, eventId: event.id };
+  }
+
+  // The work starts from the domain's last mining event, so it is only good if that is still the last one when it
+  // ends: an action made meanwhile (a burn, a claim) moves the chain on, and this work is dropped and done again
+  // from the new head (a few seconds at most). `eventId: null, discarded: true` if the chain would not hold still.
+  async _advanceChained({ epochs }) {
+    const id = this.identity.id;
+    const iterations = epochs * this.rewardParams.epochIterations;
+    let epoch = 0;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const state = await this._materializeWallet();
+      const current = state.accrual.progression.domains[id] ?? { epoch: 0, vdfOutput: null, lastId: null };
+      const previous = miningChainHead(state.accrual, id);
+      epoch = current.epoch + epochs;
+      const { vdfOutput, vdfProof } = await computeSuccinctEpochs(progressionSeed(id, current.vdfOutput, previous), iterations);
+      const made = await this._withMiningLock(async () => {
+        if ((await this._miningPrevious()) !== previous) return null;
+        const signed = await buildSignedProgressionEvent(
+          { domain: id, epoch, vdfIterations: iterations, vdfOutput, previous },
+          this._keypair.secretKey.slice(0, 32), this._keypair.publicKey.toBytes(),
+        );
+        const event = await createEvent(this.identity, {
+          domain: this.logDomain, parents: await this.log.head(), type: 'progression', payload: { ...signed, vdfProof },
+        });
+        await this.log.append(event);
+        return { epoch, eventId: event.id };
+      });
+      if (made) return made;
+    }
+    return { epoch: epoch - epochs, eventId: null, discarded: true };
   }
 
   /** Calls advanceProgress() on a real timer until stopProgressLoop() — the practical way a wallet UI keeps its own claimable() genuinely growing while open. Errors are surfaced via onError rather than left to reject silently in the background. */
@@ -692,17 +777,19 @@ export class AIWA {
   /** Moves `amount` (decimal string) from claimable into a real, spendable claim you own. */
   async claim(amount) {
     this._requireConnected();
-    const heads = await this.log.head();
-    const claimId = crypto.randomUUID();
-    const signedClaim = await buildSignedClaimEvent(
-      { domain: this.identity.id, amount, claimId },
-      this._keypair.secretKey.slice(0, 32), this._keypair.publicKey.toBytes(),
-    );
-    const event = await createEvent(this.identity, {
-      domain: this.logDomain, parents: heads, type: 'claim', payload: signedClaim,
+    return this._withMiningLock(async () => {
+      const heads = await this.log.head();
+      const claimId = crypto.randomUUID();
+      const signedClaim = await buildSignedClaimEvent(
+        { domain: this.identity.id, amount, claimId, previous: await this._miningPrevious() },
+        this._keypair.secretKey.slice(0, 32), this._keypair.publicKey.toBytes(),
+      );
+      const event = await createEvent(this.identity, {
+        domain: this.logDomain, parents: heads, type: 'claim', payload: signedClaim,
+      });
+      await this.log.append(event);
+      return { claimId, eventId: event.id };
     });
-    await this.log.append(event);
-    return { claimId, eventId: event.id };
   }
 
   /**
@@ -1226,14 +1313,17 @@ export class Channel {
     this._requireConfirmed();
     const aiwa = this._aiwa;
     const claimId = crypto.randomUUID();
-    const signedClaim = await buildSignedDelegatedClaimEvent(
-      this._delegation, { claimId, amount },
-      this._keypair.secretKey.slice(0, 32), this._keypair.publicKey.toBytes(),
-    );
-    const event = await createEvent(this.identity, {
-      domain: aiwa.logDomain, parents: await aiwa.log.head(), type: 'delegated-claim', payload: signedClaim,
+    const event = await aiwa._withMiningLock(async () => {
+      const signedClaim = await buildSignedDelegatedClaimEvent(
+        this._delegation, { claimId, amount, previous: await aiwa._miningPrevious() },
+        this._keypair.secretKey.slice(0, 32), this._keypair.publicKey.toBytes(),
+      );
+      const made = await createEvent(this.identity, {
+        domain: aiwa.logDomain, parents: await aiwa.log.head(), type: 'delegated-claim', payload: signedClaim,
+      });
+      await aiwa.log.append(made);
+      return made;
     });
-    await aiwa.log.append(event);
     if (aiwa.replicator) await aiwa.replicator.publish(await collectAncestors(aiwa.log, [event.id]));
     return { claimId, eventId: event.id };
   }
