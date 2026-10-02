@@ -1,5 +1,7 @@
 # aiwa-lib
 
+> **New here?** What Aiwa is and how it works end to end, in plain words: [EXPLAINED.md](https://github.com/theodoreyong9/Aiwa_project/blob/main/EXPLAINED.md) (français : [EXPLICATION.md](https://github.com/theodoreyong9/Aiwa_project/blob/main/EXPLICATION.md)).
+
 The public, developer-facing facade over [`aiwa-core`](https://github.com/theodoreyong9/Aiwa_core)
 (validation: identity, events, progression/VDF, reward, accrual,
 conservation) and [`aiwa-platform`](https://github.com/theodoreyong9/Aiwa_platform)
