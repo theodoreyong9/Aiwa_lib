@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { SOLANA_INCINERATOR_ADDRESS, assessMining } from 'aiwa-core';
+import { SOLANA_INCINERATOR_ADDRESS, assessMining, assessSubmission } from 'aiwa-core';
 import { AIWA } from '../src/wallet.js';
 import { collectAncestors } from '../src/ancestors.js';
 
@@ -298,4 +298,30 @@ test('a wallet connected from a raw secret key has no phrase but a key to keep â
   assert.equal(fresh.recoveryKey, null, 'a wallet made from a phrase shows its phrase, not a key');
   await a.disconnect();
   assert.equal(a.recoveryKey, null);
+});
+
+test('a continuation does not send again the burns the validator already counted â€” and sends one made after its baseline', async () => {
+  const aiwa = await wallet(succinct);
+  const connection = solana({ s1: { payer: aiwa, lamports: 2e9 }, s2: { payer: aiwa, lamports: 2e9 } });
+  await aiwa.recordBurn('s1', connection);
+  await aiwa.recordCommitment({ b: 1.5 });
+  await aiwa.advanceProgress({ epochs: 2 });
+  const first = await assessSubmission({ rewardParams: succinct, evidence: await aiwa.submissionEvidence(), domain: aiwa.identity.id, connection });
+  assert.equal(first.ok, true, first.reason);
+
+  await aiwa.advanceProgress();
+  const quiet = await aiwa.submissionEvidence({ afterEpoch: first.baseline.epoch, after: first.baseline.head });
+  assert.equal(quiet.events.filter((e) => e.type === 'burn-record').length, 0, 'the burn the validator counted is not sent again');
+  const next = await assessSubmission({ rewardParams: succinct, evidence: quiet, domain: aiwa.identity.id, baseline: first.baseline, connection });
+  assert.deepEqual(next.rejections, [], 'so nothing is refused as "already counted"');
+
+  await aiwa.recordBurn('s2', connection);                    // a burn after the baseline: it must go, to cover what follows
+  await aiwa.recordCommitment({ b: 1.8 });
+  await aiwa.advanceProgress();
+  const loud = await aiwa.submissionEvidence({ afterEpoch: first.baseline.epoch, after: first.baseline.head });
+  assert.deepEqual(loud.events.filter((e) => e.type === 'burn-record').map((e) => e.payload.signature), ['s2']);
+  const last = await assessSubmission({ rewardParams: succinct, evidence: loud, domain: aiwa.identity.id, baseline: first.baseline, connection });
+  assert.equal(last.ok, true, last.reason);
+  assert.deepEqual(last.rejections, []);
+  assert.equal(last.mining.capital, 1.8);
 });

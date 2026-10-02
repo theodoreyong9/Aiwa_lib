@@ -691,7 +691,7 @@ export class AIWA {
    * @param {object} [options]
    * @param {string} [options.after] the id of the last mining event the validator holds (its baseline's `chainHead`):
    *   only the events after it are returned — the chain of progression, accrual and claim events from there, and the
-   *   burn records (a validator ignores the ones it already counted)
+   *   burn records made since
    * @param {number} [options.afterEpoch] leave out the progression events up to this epoch (when `after` is not known)
    */
   async exportMiningEvents({ afterEpoch = 0, after = null } = {}) {
@@ -715,7 +715,10 @@ export class AIWA {
         tail.add(id);
         id = byId.get(id).payload.previous ?? null;
       }
-      events = events.filter((e) => e.type === 'burn-record' || tail.has(e.id));
+      // Burn records are not in the chain: the ones made before the validator's own last event were in what it already
+      // folded (it counted them), so only the later ones go again — a burn made after its baseline must, to cover what follows.
+      const known = byId.get(after);
+      events = events.filter((e) => tail.has(e.id) || (e.type === 'burn-record' && (!known || e.createdAt > known.createdAt)));
     } else {
       events = events.filter((e) => e.type !== 'progression' || e.payload.epoch > afterEpoch);
     }

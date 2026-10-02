@@ -709,7 +709,7 @@ was silently rejected until this was accounted for.
 
 ## Status
 
-90 passing `node --test` cases. Depends on `aiwa-core` and
+91 passing `node --test` cases. Depends on `aiwa-core` and
 `aiwa-platform` via their GitHub URLs (none of the three are on npm
 yet).
 
