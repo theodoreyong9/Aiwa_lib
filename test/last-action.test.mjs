@@ -281,3 +281,21 @@ test('a passphrase or a raw secret key has no recovery phrase to show', async ()
   assert.equal(b.recoveryPhrase, null);
   await assert.rejects(new AIWA({ rewardParams: base }).connect({ mnemonic: 'not a real phrase at all' }), /BIP39/);
 });
+
+test('a wallet connected from a raw secret key has no phrase but a key to keep — in the form Solana wallets export — that logs back in', async () => {
+  const { generateLightweightKeypair, base58Decode } = await import('aiwa-core');
+  const kp = await generateLightweightKeypair();
+  const a = new AIWA({ rewardParams: base });
+  await a.connect({ secretKeyBytes: kp.secretKey });
+  assert.equal(a.recoveryPhrase, null);
+  const key = a.recoveryKey;
+  assert.deepEqual(base58Decode(key), kp.secretKey);
+  const again = new AIWA({ rewardParams: base });
+  await again.connect({ secretKeyBytes: base58Decode(key) });
+  assert.equal(again.address, a.address, 'the key brings the same wallet back');
+  const fresh = new AIWA({ rewardParams: base });
+  await fresh.connect();
+  assert.equal(fresh.recoveryKey, null, 'a wallet made from a phrase shows its phrase, not a key');
+  await a.disconnect();
+  assert.equal(a.recoveryKey, null);
+});

@@ -43,7 +43,7 @@ import {
   buildReceptionCommitment, assessPosition, identityCostFromCommitments, identityCostFromBurns,
   fetchBurnRecord, verifyBurnRecordFor, withConfirmedBurns,
   computeSuccinctEpochs, commitmentPriceLamports, MAX_PATIENCE_RATE, miningState, rankingFigure,
-  miningChainHead, progressionSeed, deserializeWalletState,
+  miningChainHead, progressionSeed, deserializeWalletState, base58Encode,
 } from 'aiwa-core';
 import { readWorld, observations, heldProgressions, nextReceptionEpoch } from './observation.js';
 
@@ -205,13 +205,18 @@ export class AIWA {
   async connect({ mnemonic, passphrase, secretKeyBytes } = {}) {
     let keypair;
     let phrase = null;
-    if (secretKeyBytes) keypair = await lightweightKeypairFromSecretKey(secretKeyBytes);
+    let key = null;
+    if (secretKeyBytes) {
+      keypair = await lightweightKeypairFromSecretKey(secretKeyBytes);
+      key = base58Encode(keypair.secretKey);   // what a Solana wallet exports: the way back in for a wallet made from a key
+    }
     else if (passphrase) keypair = await deriveKeypairFromPassphrase(passphrase);
     else {
       phrase = (mnemonic ? mnemonic : await generateBip39Mnemonic(12)).trim().replace(/\s+/g, ' ').toLowerCase();
       keypair = await deriveKeypairFromBip39Mnemonic(phrase);
     }
     this._recoveryPhrase = phrase;
+    this._recoveryKey = key;
     this._keypair = keypair;
     this.identity = await toIdentity(keypair);
     this._domainId = this.identity.id;
@@ -225,11 +230,18 @@ export class AIWA {
     this.stopAutoCheckpoint();
     this._keypair = null;
     this._recoveryPhrase = null;
+    this._recoveryKey = null;
     this.identity = null;
   }
 
   /** The recovery phrase of this identity while connected (see connect()), or null when it was not made from one. Secret: whoever has it controls the wallet. */
   get recoveryPhrase() { return this._recoveryPhrase ?? null; }
+
+  /**
+   * For a wallet connected from a raw secret key (a Solana wallet imported as a key): that key, base58, the way Solana
+   * wallets export it — what to keep, since such a wallet has no phrase. Null otherwise. Secret, like the phrase.
+   */
+  get recoveryKey() { return this._recoveryKey ?? null; }
 
   get connected() { return !!this.identity; }
   get address() { return this._keypair ? this._keypair.publicKey.toBase58() : null; }

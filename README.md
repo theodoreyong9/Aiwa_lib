@@ -124,7 +124,9 @@ await someoneElsesAiwa.redeemVoucher(decodeOfflineBundle(voucherBlob));
 `aiwa.recoveryPhrase` while connected (null after `disconnect()`, and for a passphrase or a raw secret key). An app shows it
 once so it is written down; `connect({ mnemonic })` with those words gives the same address — the one a Solana wallet derives
 from them (`m/44'/501'/0'/0'`), so a phrase works in every Aiwa app and in a Solana wallet. Whoever has it controls the
-wallet: the library never stores it.
+wallet: the library never stores it. A wallet connected from a raw secret key (a Solana wallet imported as a key) has no
+phrase: `aiwa.recoveryKey` is that key in base58, the way Solana wallets export it — what to keep, and what logs back in
+(`connect({ secretKeyBytes })`). The shared panel shows whichever the wallet has.
 
 ### The history of a wallet: keeping it, getting it back
 
@@ -700,7 +702,7 @@ was silently rejected until this was accounted for.
 
 ## Status
 
-85 passing `node --test` cases. Depends on `aiwa-core` and
+86 passing `node --test` cases. Depends on `aiwa-core` and
 `aiwa-platform` via their GitHub URLs (none of the three are on npm
 yet).
 

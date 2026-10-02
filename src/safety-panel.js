@@ -3,7 +3,9 @@
 //
 //   mountWalletSafety(container, aiwa, { classes, sources, onRestored })
 //
-//   Recovery phrase   shown only when asked for, hidden again on demand, copyable. Never stored by this library.
+//   Recovery phrase   shown only when asked for, hidden again on demand, copyable. Never stored by this library. A wallet
+//                     that came from a raw secret key (a Solana wallet imported as a key) has no phrase: its private
+//                     key is what is shown instead, the same way.
 //   Backup            a small file (the wallet's state, signed by its key) the owner keeps; restoring it brings the
 //                     wallet back after connecting with the same phrase (aiwa.exportBackup / importBackup).
 //   Sources           where else a state may come from, which the app provides: `{ label, fetch(aiwa) }`, where fetch
@@ -45,23 +47,26 @@ export function mountWalletSafety(container, aiwa, { classes = {}, sources = [],
   container.replaceChildren();
   const status = make('div', { cls: classes.note, style: NOTE, attrs: { role: 'status' } });
 
-  // --- recovery phrase ---
+  // --- recovery phrase (or, for a wallet that came from a key, the key) ---
+  const secretOf = () => (aiwa.recoveryPhrase ? { text: aiwa.recoveryPhrase, noun: 'recovery phrase' } : aiwa.recoveryKey ? { text: aiwa.recoveryKey, noun: 'private key' } : null);
   const phraseBox = make('div', { cls: classes.box, style: BOX });
   phraseBox.hidden = true;
   const copyButton = button('Copy', async () => {
-    try { await navigator.clipboard.writeText(aiwa.recoveryPhrase); say('Phrase copied.'); } catch { say('Could not copy: select the words and copy them.'); }
+    try { await navigator.clipboard.writeText(secretOf().text); say('Copied.'); } catch { say('Could not copy: select it and copy it.'); }
   });
   copyButton.hidden = true;
-  const hide = () => { phraseBox.hidden = true; phraseBox.textContent = ''; copyButton.hidden = true; showButton.textContent = 'Show recovery phrase'; };
-  const showButton = button('Show recovery phrase', () => {
+  const initial = secretOf();
+  const label = (shown) => `${shown ? 'Hide' : 'Show'} ${initial ? initial.noun : 'recovery phrase'}`;
+  const hide = () => { phraseBox.hidden = true; phraseBox.textContent = ''; copyButton.hidden = true; showButton.textContent = label(false); };
+  const showButton = button(label(false), () => {
     if (!phraseBox.hidden) { hide(); return; }
-    const phrase = aiwa.recoveryPhrase;
-    if (!phrase) { say('This identity was made from a key, not a phrase, so there is no phrase to show. Use a backup.'); return; }
-    phraseBox.textContent = phrase;
+    const secret = secretOf();
+    if (!secret) { say('This wallet has neither a phrase nor a key to show. Use a backup.'); return; }
+    phraseBox.textContent = secret.text;
     phraseBox.hidden = false;
     copyButton.hidden = false;
-    showButton.textContent = 'Hide recovery phrase';
-    say('');
+    showButton.textContent = label(true);
+    say(secret.noun === 'private key' ? 'This wallet was made from a key, not a phrase: this key is what to keep. Import it to log back in (here, or in any Solana wallet).' : '');
   });
 
   // --- backup / restore ---
@@ -94,9 +99,9 @@ export function mountWalletSafety(container, aiwa, { classes = {}, sources = [],
 
   const row = (...els) => { const r = make('div'); r.append(...els); return r; };
   const parts = [
-    note('Your recovery phrase is the only way to log back in. Write it down and keep it private: whoever has it controls this wallet.'),
+    note(`Your ${initial ? initial.noun : 'recovery phrase'} is the only way to log back in. Write it down and keep it private: whoever has it controls this wallet.`),
     row(showButton, copyButton), phraseBox,
-    note('A backup brings your history back (mining, claimed AIWA) after you log in with your phrase.'),
+    note('A backup brings your history back (mining, claimed AIWA) after you log back in.'),
     row(download, restore, picker),
   ];
   for (const source of sources) {
