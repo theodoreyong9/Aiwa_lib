@@ -4,10 +4,16 @@
 // requires every parent to already be known, recursively, so handing
 // someone a leaf event alone (e.g. in a QR code) without its real
 // ancestor chain is simply not appendable on their side.
+//
+// The order it returns is aiwa-core's canonicalOrder: parents before children and, between events that do not know of each
+// other, the smaller id first — the same for every reader holding the same events, so that a conflict (one claim spent twice)
+// has the same winner everywhere instead of the one that happened to arrive first.
+
+import { canonicalOrder } from 'aiwa-core';
 
 /**
- * Every real event reachable from `eventIds` (inclusive), in an order
- * EventLog.appendMany() can apply directly (parents before children).
+ * Every real event reachable from `eventIds` (inclusive), in canonical order (parents before children, so
+ * EventLog.appendMany() can apply it directly).
  *
  * `excludeIds`, if given, stops the walk the instant it reaches one of
  * them — never recursing into their own parents. Passing a domain's
@@ -35,5 +41,5 @@ export async function collectAncestors(log, eventIds, { excludeIds, tolerant = f
     collected.push(event);
   }
   for (const id of eventIds) await visit(id);
-  return collected;
+  return canonicalOrder(collected, { placed: excludeIds });
 }

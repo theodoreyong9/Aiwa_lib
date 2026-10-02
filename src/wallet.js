@@ -58,6 +58,18 @@ function randomVoucherSecret() {
 }
 
 /** Order-independent comparison of two real head sets — used to decide whether the materialization cache is still current. */
+// Whether every event of `newEvents` descends from every one of `oldHeads` (and so, in canonical order, comes after all of
+// what those heads stand for): each event of the batch that has no parent inside the batch must cite all of the old heads.
+function descendsFromAll(newEvents, oldHeads) {
+  if (newEvents.length === 0 || !oldHeads || oldHeads.length === 0) return true;
+  const inBatch = new Set(newEvents.map((e) => e.id));
+  for (const event of newEvents) {
+    if (event.parents.some((p) => inBatch.has(p))) continue;
+    if (!oldHeads.every((head) => event.parents.includes(head))) return false;
+  }
+  return true;
+}
+
 function sameHeadSet(a, b) {
   if (a.length !== b.length) return false;
   const setA = new Set(a);
@@ -493,6 +505,16 @@ export class AIWA {
     // just the latest heads (see the constructor's own comment on
     // _coveredIds for the real bug that distinction fixes).
     const newEvents = await collectAncestors(this.log, heads, { excludeIds: this._coveredIds });
+    // The fold order is canonical (aiwa-core's canonicalOrder: the same for every reader holding the same events), so that a
+    // conflict between two branches has the same winner everywhere. Folding new events on top of what is already folded is
+    // only the same thing as folding everything in that order when they all come after it — when every one of them descends
+    // from everything folded. An event that does not (a concurrent branch that just arrived: a peer's event, a bundle from
+    // a stranger) may belong BEFORE some of what is folded: start again from the checkpoint, in canonical order. Rare, and
+    // bounded by the checkpoint; the common case — the wallet's own events, each citing every head — stays incremental.
+    if (this._materializedState && !descendsFromAll(newEvents, this._materializedHeads)) {
+      this._resetMaterialization();
+      return this._materializeWallet();
+    }
     // materializeWalletFromWireEvents, not materializeWallet: newEvents
     // are the real, un-adapted wire events, and might include a real
     // checkpoint appended since the last call (e.g. our own checkpoint()

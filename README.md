@@ -707,9 +707,23 @@ was never part of what got signed and must never be part of what gets
 verified. Found this the same way: a legitimate, correctly-signed mint
 was silently rejected until this was accounted for.
 
+## When two branches contradict each other
+
+A log is a graph: events that do not know of each other are two branches, and that is harmless until they contradict (one voucher
+redeemed by two people, one token balance spent twice). The wallet folds events in aiwa-core's `canonicalOrder` — parents first, and
+between events that do not know of each other the smaller id first — so every reader holding the same events picks the **same
+winner**, whatever order they arrived in (`collectAncestors` returns that order; `Contract.state()` and the wallet use it). A wallet that
+already folded part of the log and receives a branch concurrent with it folds again from its last checkpoint (rare; the wallet's own
+events, which each cite every head, stay incremental).
+
+It is agreement, not fairness: the winner is the smaller id, not the one that came first in time, and a signer who writes two
+contradicting events can try variants until the one he wants wins. Whoever accepts a payment from someone he does not trust should
+let the histories meet first. `test/convergence.test.mjs` (fails without the change): the same voucher redeemed twice, merged in
+either order, one event at a time in random orders, and a token balance spent twice.
+
 ## Status
 
-91 passing `node --test` cases. Depends on `aiwa-core` and
+95 passing `node --test` cases. Depends on `aiwa-core` and
 `aiwa-platform` via their GitHub URLs (none of the three are on npm
 yet).
 
