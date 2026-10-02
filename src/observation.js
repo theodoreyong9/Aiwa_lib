@@ -30,7 +30,7 @@ import { collectAncestors } from './ancestors.js';
  * @returns {Promise<{ wire: object[], events: object[], mirror: object }>}
  */
 export async function readWorld(log) {
-  const wire = await collectAncestors(log, await log.head());
+  const wire = await collectAncestors(log, await log.head(), { tolerant: true });
   const events = toReducerEvents(wire);
   const mirror = await materializeMirror(events, deriveSourceEpochLookup(events));
   return { wire, events, mirror };

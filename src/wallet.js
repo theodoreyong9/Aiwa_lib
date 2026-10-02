@@ -43,7 +43,7 @@ import {
   buildReceptionCommitment, assessPosition, identityCostFromCommitments, identityCostFromBurns,
   fetchBurnRecord, verifyBurnRecordFor, withConfirmedBurns,
   computeSuccinctEpochs, commitmentPriceLamports, MAX_PATIENCE_RATE, miningState, rankingFigure,
-  miningChainHead, progressionSeed,
+  miningChainHead, progressionSeed, deserializeWalletState,
 } from 'aiwa-core';
 import { readWorld, observations, heldProgressions, nextReceptionEpoch } from './observation.js';
 
@@ -332,7 +332,7 @@ export class AIWA {
    */
   async confirmBurns(connection = this.connection) {
     if (!connection) throw new Error('AIWA: confirmBurns needs a Solana connection.');
-    const wire = await collectAncestors(this.log, await this.log.head());
+    const wire = await collectAncestors(this.log, await this.log.head(), { tolerant: true });
     const wanted = [...new Set(wire.filter((e) => e.type === 'burn-record' && typeof e.payload?.signature === 'string').map((e) => e.payload.signature))];
     const confirmed = [];
     const pending = [];
@@ -528,6 +528,89 @@ export class AIWA {
       }
     }
     return this.log.pruneBeforeCheckpoint(checkpoint.id);
+  }
+
+  // --- The history of a wallet: keeping it, and getting it back ---
+  //
+  // Everything this wallet is — its mining (epochs, position, chain head), its claimed AIWA, what it received — is
+  // folded from its log. The key comes back from the recovery phrase; the log does not, unless someone holds it. These
+  // are the ways to hold it, all the same one idea: a CHECKPOINT is the wallet's state signed by its own key, small
+  // whatever the history, and a wallet that has one is back where it was.
+  //   exportBackup() / importBackup()   a file (or a QR, a note) the owner keeps
+  //   adoptState()                      for a source that holds the STATE but not the events (a registry's baseline)
+  //   joinNetwork(transport)            peers that received your events hand them back when you reconnect
+  // The honest tradeoff, as for every checkpoint (aiwa-core): a peer who only ever sees the backup trusts its signature
+  // instead of re-deriving the history from genesis.
+
+  /**
+   * A backup of this wallet: its state as of now, signed by its key — a checkpoint, plus anything after it. Small
+   * however long the history, safe to keep anywhere (it holds no secret: whoever reads it learns the balances and the
+   * mining state, which are public in any case; spending still needs the key). Restore it with importBackup() after
+   * connecting with the same recovery phrase.
+   * @returns {Promise<{ version: number, kind: string, domain: string, address: string, createdAt: number, epoch: number, events: object[] }>}
+   */
+  async exportBackup() {
+    this._requireConnected();
+    const domain = this.identity.id;
+    let checkpoint = await findLatestCheckpoint(this.log, domain);
+    const heads = await this.log.head();
+    // a checkpoint that is already the whole of the log is the backup as it stands
+    if (!checkpoint || !(heads.length === 1 && heads[0] === checkpoint.id)) {
+      const made = await this.checkpoint();
+      checkpoint = await this.log.get(made.eventId);
+    }
+    const mining = await this.mining();
+    return {
+      version: 1, kind: 'aiwa-backup', domain, address: this.address, createdAt: Date.now(),
+      epoch: mining ? mining.epoch : 0, events: [checkpoint],
+    };
+  }
+
+  /**
+   * Puts a backup (exportBackup()) back: after connecting with the same recovery phrase the wallet is where the backup
+   * left it. Refused if the backup is of another identity, or no further along than this wallet already is.
+   * @returns {Promise<{ epoch: number, restored: boolean }>}
+   */
+  async importBackup(backup) {
+    this._requireConnected();
+    if (!backup || backup.kind !== 'aiwa-backup' || !Array.isArray(backup.events)) throw new Error('AIWA: this is not an Aiwa backup.');
+    if (backup.domain !== this.identity.id) throw new Error('AIWA: this backup is of another identity — connect with its recovery phrase first.');
+    const before = (await this.mining())?.epoch ?? 0;
+    if (backup.events.some((e) => e.author !== this.identity.id)) throw new Error('AIWA: a backup holds only this identity\'s own events.');
+    if (backup.epoch <= before && before > 0) return { epoch: before, restored: false };
+    await this.log.appendMany(backup.events);
+    this._resetMaterialization();
+    return { epoch: (await this.mining())?.epoch ?? 0, restored: true };
+  }
+
+  /**
+   * For a source that holds this wallet's STATE but not its events — a registry that kept what it derived from the
+   * wallet's submissions (aiwa-core's assessSubmission baseline). Writes that state as a checkpoint signed by this key.
+   * Trusts the source completely: take it only from one you trust. Refused unless it is strictly further along than
+   * the wallet already is (it can never roll a wallet back). What a state from a registry does not hold is what the
+   * registry never saw (value received from others): that comes from a backup or from peers.
+   * @param {string|object} serializedState a wallet state as aiwa-core's serializeWalletState wrote it
+   * @returns {Promise<{ epoch: number, adopted: boolean }>}
+   */
+  async adoptState(serializedState) {
+    this._requireConnected();
+    const me = this.identity.id;
+    const state = typeof serializedState === 'string' ? deserializeWalletState(serializedState) : deserializeWalletState(serializedState);
+    const epoch = state?.accrual?.progression?.domains?.[me]?.epoch ?? 0;
+    if (!state?.accrual || (epoch === 0 && !state.accrual.positions?.[me])) throw new Error('AIWA: this state holds nothing of this identity.');
+    const before = (await this.mining())?.epoch ?? 0;
+    if (epoch <= before) return { epoch: before, adopted: false };
+    const heads = await this.log.head();
+    const event = await buildCheckpointEvent(this.identity, { logDomain: this.logDomain, parents: heads, coveredHeads: heads, walletState: state });
+    await this.log.append(event);
+    this._resetMaterialization();
+    return { epoch: (await this.mining())?.epoch ?? epoch, adopted: true };
+  }
+
+  _resetMaterialization() {
+    this._materializedState = null;
+    this._materializedHeads = null;
+    this._coveredIds = new Set();
   }
 
   /**

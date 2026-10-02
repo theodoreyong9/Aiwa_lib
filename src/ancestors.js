@@ -20,13 +20,16 @@
  * delta on every later call, instead of paying the full replay cost
  * again each time.
  */
-export async function collectAncestors(log, eventIds, { excludeIds } = {}) {
+export async function collectAncestors(log, eventIds, { excludeIds, tolerant = false } = {}) {
   const seen = new Set(excludeIds ?? []);
   const collected = [];
   async function visit(id) {
     if (seen.has(id)) return;
     seen.add(id);
     const event = await log.get(id);
+    // `tolerant`: a log that was pruned to a checkpoint (or restored from one) no longer holds what the checkpoint
+    // covers. Reading what IS there (to look at other domains, say) must not fail on that; bundling for a stranger must.
+    if (!event && tolerant) return;
     if (!event) throw new Error(`collectAncestors: event ${id} is not in this log — cannot bundle what we don't have.`);
     for (const parentId of event.parents) await visit(parentId);
     collected.push(event);

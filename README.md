@@ -126,6 +126,29 @@ once so it is written down; `connect({ mnemonic })` with those words gives the s
 from them (`m/44'/501'/0'/0'`), so a phrase works in every Aiwa app and in a Solana wallet. Whoever has it controls the
 wallet: the library never stores it.
 
+### The history of a wallet: keeping it, getting it back
+
+The key comes back from the recovery phrase; the log (mining, claimed AIWA, what you received) must come back from
+somewhere. Everything below rests on one idea: a **checkpoint** is the wallet's state signed by its own key — small
+however long the history — and a wallet that has one is back where it was.
+
+- **`exportBackup()` / `importBackup(backup)`** — a small file (the checkpoint) the owner keeps; connect with the same
+  phrase, import it, carry on (the chain a validator kept still accepts what comes next — tested). Refused if it is of
+  another identity or no further along than the wallet already is: it never rolls a wallet back.
+- **`adoptState(state)`** — for a source that holds the *state* but not the events: a registry that kept what it derived
+  from the wallet's submissions (aiwa-core's `assessSubmission` baseline). Trusts the source completely; same refusals.
+  What the registry never saw (value received from others) is not in it: that comes from a backup or from peers.
+- **`joinNetwork(transport)`** — peers that received your events hand them back when you reconnect (the replicator syncs
+  both ways). Aiwa has no always-on server, so this works as far as you have peers connected.
+- **`mountWalletSafety(container, aiwa, { sources, classes, onRestored })`** — the screen part, the same in every app:
+  the recovery phrase (shown only when asked for), *Download backup*, *Restore from backup file*, and a button per
+  `source` the app provides (`{ label, fetch(aiwa) → { backup } | { state } | null }`). An app mounts it instead of
+  writing its own.
+
+Tradeoff, as for every checkpoint: someone who only sees a backup trusts its signature instead of re-deriving the history
+from genesis. Reading the world (`witnesses()`, `position()`, `observe()`, `confirmBurns()`) now works on a log that was
+pruned to a checkpoint or restored from one (it used to throw on the events the checkpoint covers).
+
 ### The offline send/receive path — the real killer feature, honestly scoped
 
 A stranger with zero prior sync needs the FULL real ancestor chain for
@@ -677,7 +700,7 @@ was silently rejected until this was accounted for.
 
 ## Status
 
-81 passing `node --test` cases. Depends on `aiwa-core` and
+85 passing `node --test` cases. Depends on `aiwa-core` and
 `aiwa-platform` via their GitHub URLs (none of the three are on npm
 yet).
 
