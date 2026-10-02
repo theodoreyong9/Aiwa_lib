@@ -63,7 +63,7 @@ function sameHeadSet(a, b) {
   const setA = new Set(a);
   return b.every((id) => setA.has(id));
 }
-import { Replicator } from 'aiwa-platform';
+import { Replicator, pushToNodes, fetchFromNodes } from 'aiwa-platform';
 import { collectAncestors } from './ancestors.js';
 
 // A real, DETERMINISTIC per-(root, peer) session key — HMAC-SHA256
@@ -228,6 +228,7 @@ export class AIWA {
     await this.leaveNetwork();
     this.stopProgressLoop();
     this.stopAutoCheckpoint();
+    this.stopAutoArchive();
     this._keypair = null;
     this._recoveryPhrase = null;
     this._recoveryKey = null;
@@ -617,6 +618,63 @@ export class AIWA {
     await this.log.append(event);
     this._resetMaterialization();
     return { epoch: (await this.mining())?.epoch ?? epoch, adopted: true };
+  }
+
+  // --- The archive: a copy of the backup somewhere always there (aiwa-platform's archive node) ---
+
+  /**
+   * Pushes this wallet's current backup to the archive nodes (addresses, or a function returning them). Several nodes: it goes
+   * to all, and one that is down does not stop the others.
+   * @returns {Promise<{ ok: Array, failed: Array, skipped?: boolean }>}
+   */
+  async archiveNow(nodes) {
+    this._requireConnected();
+    const list = (typeof nodes === 'function' ? nodes() : nodes) ?? [];
+    if (list.length === 0) return { ok: [], failed: [], skipped: true };
+    const backup = await this.exportBackup();
+    const result = await pushToNodes(list, backup);
+    this._lastArchivedHeads = await this.log.head();
+    return { ...result, epoch: backup.epoch };
+  }
+
+  /**
+   * After logging in with the recovery phrase on a new device: asks the archive nodes for this identity's backup, takes the most
+   * recent, and imports it (importBackup: never rolls a wallet back, refuses another identity).
+   * @returns {Promise<{ found: boolean, node?: string, epoch?: number, restored?: boolean }>}
+   */
+  async restoreFromArchive(nodes) {
+    this._requireConnected();
+    const list = (typeof nodes === 'function' ? nodes() : nodes) ?? [];
+    if (list.length === 0) throw new Error('AIWA: no archive node to ask — add the address of one.');
+    const found = await fetchFromNodes(list, this.identity.id);
+    if (!found) return { found: false };
+    return { found: true, node: found.node, ...(await this.importBackup(found.backup)) };
+  }
+
+  /**
+   * Keeps the archive up to date: every `intervalMs`, if the wallet changed since the last time, its backup goes to the nodes.
+   * `nodes` may be a function, so that a node added later is used. Nothing happens while the list is empty.
+   */
+  startAutoArchive({ nodes, intervalMs = 5 * 60_000, onError, onArchived } = {}) {
+    this.stopAutoArchive();
+    this._archiveTimer = setInterval(() => {
+      if (this._archiveBusy || !this.identity) return;
+      const list = (typeof nodes === 'function' ? nodes() : nodes) ?? [];
+      if (list.length === 0) return;
+      this._archiveBusy = true;
+      this.log.head()
+        .then(async (heads) => {
+          if (this._lastArchivedHeads && sameHeadSet(this._lastArchivedHeads, heads)) return null;
+          return this.archiveNow(list);
+        })
+        .then((result) => { if (result) onArchived?.(result); })
+        .catch((err) => onError?.(err))
+        .finally(() => { this._archiveBusy = false; });
+    }, intervalMs);
+  }
+
+  stopAutoArchive() {
+    if (this._archiveTimer) { clearInterval(this._archiveTimer); this._archiveTimer = null; }
   }
 
   _resetMaterialization() {

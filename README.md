@@ -142,9 +142,16 @@ however long the history — and a wallet that has one is back where it was.
   What the registry never saw (value received from others) is not in it: that comes from a backup or from peers.
 - **`joinNetwork(transport)`** — peers that received your events hand them back when you reconnect (the replicator syncs
   both ways). Aiwa has no always-on server, so this works as far as you have peers connected.
+- **The archive** (`archiveNow(nodes)`, `restoreFromArchive(nodes)`, `startAutoArchive({ nodes })`) — an **archive node**
+  (aiwa-platform: `node/aiwa-node.js`, run by anyone, on a phone under Termux if need be) keeps the latest backup of each
+  wallet, and the wallet pushes one whenever it changed (every 5 minutes at most, to every node it knows; one that is down
+  does not stop the others). After a lost device: log in with the recovery phrase, `restoreFromArchive` takes the most recent
+  backup the nodes hold and imports it. A node cannot forge a backup (it is signed by the wallet's key) nor hand one wallet
+  another's; it can withhold or forget — use several. `loadArchiveNodes()` / `saveArchiveNodes()` keep the addresses in the
+  browser (`localStorage`), the same list the shared panel and `startAutoArchive({ nodes: () => loadArchiveNodes() })` read.
 - **`mountWalletSafety(container, aiwa, { sources, classes, onRestored })`** — the screen part, the same in every app:
-  the recovery phrase (shown only when asked for), *Download backup*, *Restore from backup file*, and a button per
-  `source` the app provides (`{ label, fetch(aiwa) → { backup } | { state } | null }`). An app mounts it instead of
+  the recovery phrase (shown only when asked for), *Download backup*, *Restore from backup file*, *Archive nodes* (add the
+  address of one, *Back up now*, *Restore from the nodes*), and a button per `source` the app provides (`{ label, fetch(aiwa) → { backup } | { state } | null }`). An app mounts it instead of
   writing its own.
 
 Tradeoff, as for every checkpoint: someone who only sees a backup trusts its signature instead of re-deriving the history
@@ -702,7 +709,7 @@ was silently rejected until this was accounted for.
 
 ## Status
 
-86 passing `node --test` cases. Depends on `aiwa-core` and
+90 passing `node --test` cases. Depends on `aiwa-core` and
 `aiwa-platform` via their GitHub URLs (none of the three are on npm
 yet).
 

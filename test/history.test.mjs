@@ -102,3 +102,85 @@ test('adoptState: a registry\'s baseline (the state it derived, not the events) 
   await stranger.connect();
   await assert.rejects(stranger.adoptState(baseline.state), /nothing of this identity/);
 });
+
+// --- The archive: an always-on node holds the backup, and a wallet logging in on a new device gets it back ---------------
+
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createArchiveServer } from 'aiwa-platform/archive-server';
+import { loadArchiveNodes, saveArchiveNodes } from '../src/archive-nodes.js';
+
+async function archiveNode() {
+  const dir = mkdtempSync(join(tmpdir(), 'aiwa-lib-node-'));
+  const server = createArchiveServer({ dir });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  return { url: `http://127.0.0.1:${server.address().port}`, close: () => { server.closeAllConnections(); server.close(); rmSync(dir, { recursive: true, force: true }); } };
+}
+
+test('a lost device: the phrase brings the key back and the archive node brings the history back', async () => {
+  const node = await archiveNode();
+  try {
+    const a = await minedWallet();
+    const pushed = await a.archiveNow([node.url]);
+    assert.equal(pushed.ok.length, 1);
+    assert.equal(pushed.epoch, 5);
+
+    const phone = await sameKey(a);                                  // a new phone: the phrase, nothing else
+    assert.equal(await phone.mining(), null);
+    const got = await phone.restoreFromArchive([node.url]);
+    assert.deepEqual([got.found, got.restored, got.epoch], [true, true, 5]);
+    assert.equal((await phone.mining()).chainHead, (await a.mining()).chainHead);
+    assert.equal(await phone.spendableBalance(), await a.spendableBalance());
+    await phone.advanceProgress({ epochs: 1 });
+    assert.equal((await phone.mining()).epoch, 6, 'and it carries on');
+  } finally { node.close(); }
+});
+
+test('the archive says plainly when there is nothing to restore from', async () => {
+  const node = await archiveNode();
+  try {
+    const a = new AIWA({ rewardParams: params });
+    await a.connect();
+    await assert.rejects(a.restoreFromArchive([]), /no archive node/);
+    assert.deepEqual(await a.restoreFromArchive([node.url]), { found: false }, 'a node that holds nothing for this identity');
+    assert.deepEqual(await a.archiveNow([]), { ok: [], failed: [], skipped: true });
+    const down = await a.archiveNow(['http://127.0.0.1:1']);
+    assert.equal(down.failed.length, 1, 'a node that is down is reported, not thrown');
+  } finally { node.close(); }
+});
+
+test('startAutoArchive keeps the node up to date while the wallet changes, and does nothing when it did not', async () => {
+  const node = await archiveNode();
+  try {
+    const a = await minedWallet();
+    const pushes = [];
+    let list = [];                                                    // no node yet: nothing happens
+    a.startAutoArchive({ nodes: () => list, intervalMs: 25, onArchived: (r) => pushes.push(r) });
+    await new Promise((r) => setTimeout(r, 120));
+    assert.equal(pushes.length, 0);
+    list = [node.url];                                                // a node added later is used
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(pushes.length, 1, 'one backup, then nothing while nothing changes');
+    await new Promise((r) => setTimeout(r, 120));
+    assert.equal(pushes.length, 1);
+    await a.advanceProgress({ epochs: 1 });
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(pushes.length, 2, 'the wallet moved: a new backup');
+    assert.equal(pushes.at(-1).epoch, 6);
+    a.stopAutoArchive();
+  } finally { node.close(); }
+});
+
+test('the list of archive nodes is kept in the browser, checked, and shared by everything that reads it', () => {
+  const store = {};
+  globalThis.localStorage = { getItem: (k) => store[k] ?? null, setItem: (k, v) => { store[k] = v; } };
+  try {
+    assert.deepEqual(loadArchiveNodes({ defaults: ['https://default.example'] }), ['https://default.example']);
+    assert.deepEqual(saveArchiveNodes(['https://a.example/', 'https://a.example', 'http://192.168.1.5:8787/x']), ['https://a.example', 'http://192.168.1.5:8787']);
+    assert.deepEqual(loadArchiveNodes(), ['https://a.example', 'http://192.168.1.5:8787']);
+    assert.throws(() => saveArchiveNodes(['http://example.com']), /https/);
+    store['aiwa-archive-nodes'] = JSON.stringify(['https://ok.example', 'garbage', 'http://example.com']);
+    assert.deepEqual(loadArchiveNodes(), ['https://ok.example'], 'invalid entries are dropped when read');
+  } finally { delete globalThis.localStorage; }
+});

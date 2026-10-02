@@ -7,4 +7,5 @@
 export { AIWA, Channel, encodeOfflineBundle, decodeOfflineBundle, fromUnits, toUnits, SOLANA_INCINERATOR_ADDRESS } from './wallet.js';
 export { collectAncestors } from './ancestors.js';
 export { mountWalletSafety } from './safety-panel.js';
+export { loadArchiveNodes, saveArchiveNodes } from './archive-nodes.js';
 export { defineContract, Contract, signedAction, verifySignedAction } from './contract.js';
